@@ -1,18 +1,6 @@
 """Streamlit UI for the Pattern Profiler."""
 
 import json
-import sys
-from pathlib import Path
-
-# Ensure the project root is on sys.path so absolute imports work
-# when Streamlit runs this file directly.
-from dotenv import load_dotenv
-
-_project_root = str(Path(__file__).resolve().parent.parent.parent)
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import anthropic
 import numpy as np
@@ -35,8 +23,6 @@ from cluster_profiler.clustering import build_features, discover_clusters
 from cluster_profiler.data_loader import apply_filters, load_data
 from cluster_profiler.formatters import format_json
 from cluster_profiler.profiler import build_subset_summary, profile_all_clusters
-
-st.set_page_config(page_title="Pattern Profiler", layout="wide")
 
 
 @st.cache_data
@@ -140,7 +126,7 @@ def generate_pattern_summary(profile_json: str, pattern_id: int, total_members: 
             "role": "user",
             "content": (
                 f"You are summarizing a member pattern from a health plan population analysis. "
-                f"This is pattern {pattern_id} out of a population of {total_members} members. "
+                f"This is pattern {pattern_id} out of a sub-population of {total_members} members. "
                 f"Write a concise 2-3 sentence plain-language summary describing who these members are "
                 f"based on their demographics, family structure, and categorical attributes. "
                 f"Focus on what makes this group distinctive. Do not use bullet points or headers.\n\n"
@@ -168,7 +154,7 @@ auto_run = st.session_state.pop("auto_run", False)
 st.sidebar.header("Hierarchy Filters")
 
 if st.sidebar.button("Back to Overview"):
-    st.switch_page("app.py")
+    st.switch_page("pages/top_50.py")
 
 # Helper: build options list from pairs dataframe
 def _build_options(pairs_df, key_col, name_col):
