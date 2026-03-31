@@ -3,19 +3,20 @@
 ## Overview
 
 The synthetic generator creates realistic Facets-style enrollment data with embedded
-cluster structure. Each generated record conforms to the 56-column
+**per-level cluster structure**. Each generated record conforms to the 56-column
 `MEMBER_GROUP_PLAN_FLAT` schema (defined in `POC/facets_denorm_extraction.sql`), and
-members are assigned to pre-defined demographic clusters with Gaussian noise on
-continuous attributes. The clusters are designed to be recoverable from the raw data
-using standard unsupervised techniques.
+members are assigned to independent clusters at **four hierarchy levels** — group,
+subgroup, plan, and product — whose signals are blended via a weighted Gaussian
+mixture. The clusters are designed to be recoverable from the raw data using standard
+unsupervised techniques (K-means) when validated within the appropriate hierarchical
+partition.
 
 The generator operates in two modes:
 
-- **Config mode** (default) -- reads cluster centroids and hierarchy definitions from
-  a YAML file.
-- **Auto mode** -- programmatically selects the number of clusters, places
-  well-separated centroids, and generates the full configuration without any input
-  file.
+- **Config mode** (default) — reads explicit group definitions with nested
+  subgroups/plans/products and per-level cluster centroids from a YAML file.
+- **Auto mode** — programmatically creates groups with well-separated per-level
+  cluster centroids without any input file.
 
 All generated output is written to the `data/` directory.
 
@@ -77,8 +78,8 @@ python3 -m synthetic_generator generate [OPTIONS]
 |------|---------|-------------|
 | `--config PATH` | `synthetic_generator/config/default.yaml` | Path to YAML cluster config. Ignored when `--auto` is set. |
 | `--auto` | off | Auto-select cluster count and centroids instead of reading config. |
-| `--auto-member-clusters N` | `5` | Number of member-level clusters in auto mode. |
-| `--auto-group-clusters N` | `3` | Number of group-level clusters in auto mode. |
+| `--auto-groups N` | `6` | Number of explicit groups in auto mode. |
+| `--auto-clusters-per-level N` | `3` | Number of member clusters per hierarchy level in auto mode. |
 | `--subscribers N` | from config (600) | Total subscribers to generate. Overrides the config value. |
 | `--seed N` | `42` | Random seed for reproducibility. |
 | `--output PATH` | `data/MEMBER_GROUP_PLAN_FLAT_generated.csv` | Output CSV path. |
@@ -89,9 +90,8 @@ python3 -m synthetic_generator generate [OPTIONS]
 | File | Contents |
 |------|----------|
 | `MEMBER_GROUP_PLAN_FLAT_generated.csv` | Main dataset, 56 columns matching the extraction SQL. |
-| `MEMBER_GROUP_PLAN_FLAT_generated_labels.csv` | Ground-truth cluster assignments per member. |
-| `MEMBER_GROUP_PLAN_FLAT_generated_clusters_subscribers.png` | PCA scatter plot of subscriber clusters (when `--validate` is used). |
-| `MEMBER_GROUP_PLAN_FLAT_generated_clusters_groups.png` | PCA scatter plot of group clusters (when `--validate` is used). |
+| `MEMBER_GROUP_PLAN_FLAT_generated_labels.csv` | Ground-truth cluster assignments per member per plan. |
+| `MEMBER_GROUP_PLAN_FLAT_generated_clusters_composite.png` | PCA scatter plot of composite clustering (when `--validate` is used). |
 
 ### `validate` subcommand
 
@@ -192,81 +192,93 @@ exactly, in order:
 | 56 | `PDPD_MCTR_CCAT` | CMC_PDPD_PRODUCT | char(4) |
 
 
-## Clustering Architecture
+## Per-Level Clustering Architecture
 
-Data generation embeds cluster structure at two hierarchy levels. Clusters are
-defined by Gaussian centroids on continuous attributes and weighted categorical
-distributions. The Gaussian noise ensures natural variation within each cluster while
-maintaining enough separation for unsupervised recovery.
+Data generation embeds cluster structure independently at **four hierarchy levels**.
+Each level defines its own set of member clusters with Gaussian centroids on continuous
+attributes and weighted categorical distributions. A member's final demographics are a
+**weighted blend** of samples drawn independently from each level's assigned cluster.
 
-### Level 1: Group Clusters
+### The Four Levels
 
-Group clusters represent employer archetypes. Each group cluster defines:
+| Level | Scope | What It Represents |
+|-------|-------|--------------------|
+| **Group** | Per group (GRGR_CK) | Employer-specific demographic segments (e.g., blue-collar veterans vs. young hires) |
+| **Subgroup** | Per subgroup (SGSG_CK) | Benefit-tier demographic differences (e.g., standard tenure vs. new enrollees) |
+| **Plan** | Per plan type (CSPD_CAT) | Plan-selection demographic patterns (e.g., high vs. low utilizers for medical) |
+| **Product** | Per product (LOBD_ID) | Product-line demographic patterns (e.g., standard vs. entry-level for MED) |
 
-- **Number of groups** to generate (e.g., 5 large manufacturers, 6 small tech firms)
-- **Group attributes**: state, county, plan offerings, origination year
-- **Subscriber count**: Gaussian-sampled headcount per group
-- **Member cluster weights**: the demographic mix of employees (e.g., manufacturing
-  skews toward mid-career; tech skews toward young professionals)
+### Weighted Gaussian Mixture
 
-Different group clusters produce different member demographic mixes, which is what
-makes group-level clustering recoverable from aggregated member features.
+When generating a subscriber, the engine:
 
-### Level 2: Member Clusters
+1. **Independently picks a cluster** at each level (weighted random by cluster weights)
+2. **Samples from each level's Gaussian** independently (age, tenure)
+3. **Blends via weighted average**:
+   ```
+   final_age = w_group * age_group + w_subgroup * age_subgroup + w_plan * age_plan + w_product * age_product
+   ```
+4. **Blends categorical distributions** (sex, marital status) using the same weights,
+   then samples once from the combined distribution
+5. **Family structure** (spouse/children) comes from the group-level cluster only
+6. Demographics are fixed once per member — they do not change across plans
 
-Member clusters represent demographic segments of subscribers (MEME_REL='M'). Each
-cluster defines:
+The level weights are a global config parameter:
 
-- **Continuous centroids with Gaussian noise**:
-  - `age` (mean, std) -- drives `MEME_BIRTH_DT`
-  - `tenure_months` (mean, std) -- drives `MEME_ORIG_EFF_DT`
-- **Categorical distributions**:
-  - `meme_sex` -- probability weights for M/F
-  - `meme_marital_status` -- probability weights for S/M/D/W
-- **Family structure**:
-  - `spouse_prob` -- probability of generating a spouse (MEME_REL='S')
-  - `children` (mean, std) -- Gaussian-sampled number of dependents (MEME_REL='D')
-- **Plan preference**: which plan profile (medical_only, medical_dental, full_suite)
-  members of this cluster tend to enroll in
+```yaml
+level_weights:
+  group: 0.40
+  subgroup: 0.20
+  plan: 0.20
+  product: 0.20
+```
 
-Dependents (spouses and children) inherit their subscriber's group, enrollment
-period, and cluster label. Spouse ages are correlated with the subscriber
-(subscriber age +/- small noise). Child ages are derived from the subscriber's age.
+### Why This Works for Validation
 
-### Default Clusters (config/default.yaml)
+Each level's cluster signal contributes a known fraction of the final demographic
+values. Within a hierarchical partition where all parent-level signals are held
+constant, the target level's signal becomes dominant:
 
-The default configuration defines 3 group clusters and 5 member clusters:
+- **Group-level clusters** are recovered within each group (GRGR_CK), where the group
+  identity is constant and group-level clusters have the highest weight (40%).
+- **Subgroup-level clusters** are recovered within each (group, group_cluster)
+  partition, where the group signal is constant.
+- **Plan-level clusters** are recovered within each (group, group_cluster,
+  subgroup_cluster, plan_type) partition.
+- **Product-level clusters** are recovered within each (group, group_cluster,
+  subgroup_cluster, plan_cluster, LOBD_ID) partition.
 
-**Group clusters:**
+### Shared vs. Unique Cluster Definitions
 
-| Cluster | Groups | State | Plans Offered | Character |
-|---------|--------|-------|---------------|-----------|
-| `large_manufacturing` | 5 | OH / Franklin | Medical, Dental | Older workforce, more families |
-| `healthcare_system` | 5 | OH / Cuyahoga | Medical, Dental, Vision | Balanced demographics |
-| `small_tech` | 6 | IN / Marion | Medical, Dental | Young, many recent graduates |
+- **Group-level clusters** are **unique per group** — each group defines its own
+  demographic segments (e.g., Buckeye Manufacturing has different clusters than Great
+  Lakes Healthcare). This means `group_cluster_idx=0` in one group is not comparable
+  to `group_cluster_idx=0` in another group.
+- **Subgroup, plan, and product clusters** are **shared** across all instances — all
+  subgroups use the same cluster definitions, all medical plans use the same plan
+  clusters, etc. This makes cluster indices globally comparable: `plan_cluster_idx=0`
+  means the same thing everywhere.
 
-**Member clusters:**
+### Default Configuration (config/default.yaml)
 
-| Cluster | Age | Tenure (mo) | Marital | Family | Plan Pref |
-|---------|-----|-------------|---------|--------|-----------|
-| `recent_graduate` | 22 +/- 1.0 | 3 +/- 1.5 | 95% single | Rare | Medical only |
-| `young_professional` | 28 +/- 2.0 | 20 +/- 4 | 80% single | 15% spouse | Medical only |
-| `established_family` | 36 +/- 2.5 | 48 +/- 8 | 88% married | 85% spouse, ~2 children | Full suite |
-| `mid_career` | 47 +/- 2.5 | 96 +/- 10 | 70% married | 60% spouse, ~1 child | Medical + Dental |
-| `pre_retirement` | 59 +/- 2.0 | 168 +/- 18 | 60% married | 50% spouse | Medical + Dental |
+The default config defines 6 explicit groups with per-level clusters:
 
-### Centroid Separation
+**Groups:**
 
-For reliable unsupervised recovery, cluster centroids should be separated by at least
-2x the maximum standard deviation on at least one continuous dimension. The default
-config satisfies this:
+| Group | State | Subscribers | Character |
+|-------|-------|-------------|-----------|
+| Buckeye Manufacturing LLC | OH | 80 | Blue-collar veteran + young hire |
+| Great Lakes Healthcare | OH | 100 | Clinical staff + admin |
+| Midwest Technologies Inc | IN | 80 | Senior engineer + junior dev |
+| Heritage Financial Group | PA | 100 | Financial advisor + support staff |
+| Summit Energy Corp | WV | 90 | Plant worker + field tech |
+| Cascade Logistics LLC | KY | 100 | Driver + warehouse |
 
-| Pair | Age gap | Tenure gap | Separable? |
-|------|---------|------------|------------|
-| recent_graduate vs young_professional | 6 (3x max std) | 17 (4x max std) | Yes |
-| young_professional vs established_family | 8 (3x max std) | 28 (3.5x max std) | Yes |
-| established_family vs mid_career | 11 (4x max std) | 48 (5x max std) | Yes |
-| mid_career vs pre_retirement | 12 (5x max std) | 72 (4x max std) | Yes |
+**Shared subgroup clusters (2):** standard_tenure (older, longer tenure) vs. new_enrollee (younger, shorter tenure)
+
+**Shared plan clusters (2 per type):** medical high_utilizer vs. low_utilizer; dental regular vs. basic; vision regular vs. basic
+
+**Shared product clusters (2 per LOB):** standard (older, longer tenure) vs. entry (younger, shorter tenure)
 
 
 ## Configuration Reference
@@ -289,78 +301,87 @@ Integer. Total number of subscribers (MEME_REL='M') to generate. The actual numb
 of output rows will be larger due to dependents, multiple plans, and enrollment
 period expansion.
 
-### `group_clusters`
+### `level_weights`
 
-List of group cluster definitions. Each entry:
-
-```yaml
-- name: large_manufacturing       # Cluster label (appears in labels file)
-  weight: 0.35                    # Relative weight for subscriber assignment
-  count: 5                        # Number of groups to create in this cluster
-  attributes:
-    subscriber_count:
-      mean: 70                    # Gaussian mean for target subscriber headcount
-      std: 12                     # Gaussian std
-    grgr_state: OH                # State code (char 2)
-    grgr_county: Franklin         # County name (char 20)
-    grgr_mctr_type: COMM          # Group type code (char 4)
-    grgr_orig_year:
-      mean: 2016                  # Gaussian mean for group origination year
-      std: 2
-  name_templates:                 # Group name templates ({prefix} is replaced)
-    - "{prefix} Manufacturing LLC"
-    - "{prefix} Industrial Corp"
-  subgroup:
-    plans: [medical, dental]      # Plan types offered by this group cluster
-  member_cluster_weights:         # Demographic mix (must reference member_clusters by name)
-    young_professional: 0.20
-    established_family: 0.30
-    mid_career: 0.30
-    pre_retirement: 0.15
-    recent_graduate: 0.05
-```
-
-### `member_clusters`
-
-List of member cluster definitions. Each entry:
+Controls the relative influence of each hierarchy level on final demographics:
 
 ```yaml
-- name: young_professional        # Cluster label
-  continuous:
-    age:
-      mean: 28                    # Gaussian centroid for subscriber age
-      std: 2.0                    # Gaussian std
-    tenure_months:
-      mean: 20                    # Gaussian centroid for enrollment tenure (months)
-      std: 4
-  categorical:
-    meme_sex:                     # Probability weights for sex
-      M: 0.55
-      F: 0.45
-    meme_marital_status:          # Probability weights for marital status
-      S: 0.80
-      M: 0.20
-  family:
-    spouse_prob: 0.15             # Probability of generating a spouse member
-    children:
-      mean: 0.1                   # Gaussian mean for number of child dependents
-      std: 0.3
-  plan_preference: medical_only   # Key into plan_profiles
+level_weights:
+  group: 0.40
+  subgroup: 0.20
+  plan: 0.20
+  product: 0.20
 ```
 
-### `plan_profiles`
+Weights should sum to 1.0. Higher weight means that level's clusters contribute more
+to the final demographic values and are easier to recover.
 
-Maps profile names to lists of plan types:
+### `groups`
+
+List of explicit group definitions. Each group contains nested subgroups, plans, and
+products with member clusters at every level:
 
 ```yaml
-plan_profiles:
-  medical_only: [medical]
-  medical_dental: [medical, dental]
-  full_suite: [medical, dental, vision]
+groups:
+  - name: "Buckeye Manufacturing LLC"
+    grgr_id: "GRP01001"
+    state: OH
+    county: Franklin
+    mctr_type: COMM
+    orig_eff_dt: "2016-01-01"
+    target_subscribers: 80
+    member_clusters:               # Group-level clusters
+      - name: blue_collar_veteran
+        weight: 0.50
+        continuous:
+          age: {mean: 48, std: 3.0}
+          tenure_months: {mean: 120, std: 15}
+        categorical:
+          meme_sex: {M: 0.70, F: 0.30}
+          meme_marital_status: {M: 0.65, S: 0.20, D: 0.15}
+        family:
+          spouse_prob: 0.55
+          children: {mean: 1.2, std: 0.8}
+      - name: young_hire
+        weight: 0.50
+        ...
+    subgroups:
+      - name: "Standard Benefits"
+        sgsg_id: "SG01"
+        cscs_id: "CS01"
+        member_clusters: *sg_clusters   # Can use YAML anchors for sharing
+        plans:
+          - type: medical
+            cspi_id: "CSPI0101"
+            pdpd_id: "MEDP0101"
+            member_clusters: *med_plan_clusters
+            products:
+              - lobd_id: MED
+                member_clusters: *med_product_clusters
+          - type: dental
+            ...
 ```
 
-When a member's preferred plan profile includes plans not offered by their group, the
-generator falls back to the plans the group does offer.
+Each `member_clusters` entry defines:
+
+- **`name`**: Cluster label (appears in labels file)
+- **`weight`**: Relative probability for assignment (weights are normalized)
+- **`continuous`**: Gaussian centroids with `mean` and `std` for `age` and
+  `tenure_months`
+- **`categorical`**: Probability distributions for `meme_sex` and
+  `meme_marital_status`
+- **`family`** (group-level only): `spouse_prob` and `children` (mean, std)
+
+### `plan_enrollment_weights`
+
+Controls which plans subscribers enroll in beyond their primary plan:
+
+```yaml
+plan_enrollment_weights:
+  medical: 1.0    # All subscribers get medical
+  dental: 0.60    # 60% also get dental
+  vision: 0.30    # 30% also get vision
+```
 
 ### `enrollment`
 
@@ -373,40 +394,74 @@ enrollment:
   term_reasons: [VTRM, NPAY, MOVE]  # Randomly selected termination reason codes
 ```
 
-Terminated enrollments produce rows with `SBSG_TERM_DT` before `9999-12-31` and a
-non-empty `SBSG_MCTR_TRSN`. Reinstated enrollments produce a second enrollment period
-starting the day after termination with `SBSG_TERM_DT = 9999-12-31`.
-
 ### `group_name_prefixes`
 
-List of strings used to populate the `{prefix}` placeholder in group name templates.
-Provide at least as many prefixes as the total number of groups across all clusters.
+List of strings used for generating group names in auto mode.
+
+
+## Generation Flow
+
+For each subscriber:
+
+1. **Pick group** (weighted by `target_subscribers`)
+2. **Pick subgroup** within group (equal weight)
+3. **Pick primary plan** from subgroup's plans (medical first)
+4. **Get product** from primary plan
+5. **Pick a cluster independently at each level:**
+   - `group_cluster_idx` from group's `member_clusters`
+   - `subgroup_cluster_idx` from subgroup's `member_clusters`
+   - `plan_cluster_idx` from plan's `member_clusters`
+   - `product_cluster_idx` from product's `member_clusters`
+6. **Blend continuous attributes** using level weights:
+   ```
+   age = clip(w_g * N(gc.age) + w_sg * N(sgc.age) + w_p * N(pc.age) + w_pr * N(prc.age), 18, 70)
+   ```
+7. **Blend categorical attributes** — normalize weighted distribution, sample once
+8. **Generate family** from group-level cluster's family config
+9. **Determine additional plan enrollments** via `plan_enrollment_weights`
+10. **For additional plans**, pick plan/product clusters (for labels); demographics
+    unchanged
+11. **Generate enrollment periods** (term/reinstate logic)
+12. **Expand**: member x enrollment_period x enrolled_plans -> rows
+13. **Record labels** with cluster assignment at all four levels
 
 
 ## Validation
 
-The validation module proves that the embedded cluster structure is recoverable from
-the raw generated CSV using K-means clustering. It runs at two levels:
+The validation module proves that the embedded per-level cluster structure is
+recoverable from the raw generated CSV using K-means clustering. It validates
+**hierarchically** — each level is validated within a partition where all parent-level
+signals are held constant.
 
-### Level 1: Subscriber-Level
+### Level 1: Group-Level
 
-1. Loads the generated CSV and derives two continuous features:
-   - `age` = (`reference_date` - `MEME_BIRTH_DT`) / 365.25
-   - `tenure` = (`reference_date` - `MEME_ORIG_EFF_DT`) / 30.44
-2. Deduplicates to one row per member, then filters to subscribers only
-   (`MEME_REL = 'M'`), since subscribers are the independent unit of cluster
-   assignment.
-3. Builds a feature matrix: standardized continuous features (weighted 2x) plus
-   one-hot encoded categoricals (`MEME_SEX`, `MEME_MARITAL_STATUS`).
-4. Runs K-means for a range of k values around the true cluster count.
-5. Reports **Adjusted Rand Index (ARI)** and **silhouette score** for each k.
+Within each group (GRGR_CK), cluster subscribers by demographics (age, tenure, sex,
+marital status) and compare to `group_cluster_idx` labels. Since each group has unique
+clusters, this validates that within-group demographic segments are separable.
 
-### Level 2: Group-Level
+### Level 2: Subgroup-Level
 
-1. Aggregates subscriber features per `GRGR_CK`: mean age, age std, mean tenure,
-   percent male, percent married, subscriber count.
-2. Standardizes and runs K-means across a k range.
-3. Reports ARI and silhouette for group cluster recovery.
+Within each (GRGR_CK, group_cluster_idx) partition, cluster subscribers and compare
+to `subgroup_cluster_idx`. Holding the group-level cluster constant removes the
+dominant 40%-weight signal, making the 20%-weight subgroup signal recoverable.
+
+### Level 3: Plan-Level
+
+Within each (GRGR_CK, group_cluster_idx, subgroup_cluster_idx, CSPD_CAT) partition,
+cluster subscribers and compare to `plan_cluster_idx`. With group and subgroup signals
+constant, the plan-level signal is dominant.
+
+### Level 4: Product-Level
+
+Within each (GRGR_CK, group_cluster_idx, subgroup_cluster_idx, plan_cluster_idx,
+LOBD_ID) partition, cluster subscribers and compare to `product_cluster_idx`.
+
+### Level 5: Composite
+
+Cluster all subscribers globally using GRGR_CK as the label. Tests whether the
+blended signal is separable at the group-identity level. This level depends on how
+different the groups' demographics are — it may be weak when groups have overlapping
+profiles.
 
 ### Interpreting Results
 
@@ -417,54 +472,76 @@ the raw generated CSV using K-means clustering. It runs at two levels:
 | 0.4 - 0.6 | MODERATE | Partial recovery, some cluster overlap |
 | < 0.4 | WEAK | Clusters not clearly separable |
 
-The **silhouette score** measures how well-separated the clusters are in feature
-space. Higher is better (range -1 to 1). When the best-k-by-silhouette matches the
-true k, it means the correct number of clusters is discoverable from the data alone.
-
-### PCA Scatter Plots
-
-When `--validate` is used with `generate`, or `--plot` is passed to `validate`, the
-tool saves side-by-side PCA scatter plots showing true cluster assignments (left) vs
-K-means recovered assignments (right). These provide a visual confirmation of cluster
-separability.
+Results use a **size-weighted mean** across partitions, giving more influence to
+larger partitions where K-means is more reliable. Small partitions (< 15 members for
+plan level, < 8 for product level) are excluded.
 
 ### Benchmark Results
 
-With the default configuration (seed=42, 600 subscribers, 5 member clusters, 3 group
-clusters):
+With the default configuration (seed=42, 600 subscribers, 6 groups, 2 clusters/level):
 
-| Level | True k | ARI | Quality |
-|-------|--------|-----|---------|
-| Subscriber | 5 | 0.82 | EXCELLENT |
-| Group | 3 | 0.42 | MODERATE (16 groups is limited data) |
+| Level | Weighted Mean ARI | Quality |
+|-------|-------------------|---------|
+| Group | 0.45 | MODERATE |
+| Subgroup | 0.59 | MODERATE |
+| Plan | 0.47 | MODERATE |
+| Product | 0.72 | GOOD |
 
-With auto mode (seed=42, 600 subscribers):
+With auto mode (seed=42, 600 subscribers, 6 groups, 3 clusters/level):
 
-| Level | True k | ARI | Quality |
-|-------|--------|-----|---------|
-| Subscriber | 5 | 0.98 | EXCELLENT |
-| Group | 3 | 1.00 | EXCELLENT |
+| Level | Weighted Mean ARI | Quality |
+|-------|-------------------|---------|
+| Group | 0.75 | GOOD |
+| Subgroup | 0.70 | GOOD |
+| Plan | 0.69 | GOOD |
+| Product | 0.64 | GOOD |
 
 
 ## Labels File
 
-The labels CSV (`*_labels.csv`) contains one row per member with ground-truth
-metadata:
+The labels CSV (`*_labels.csv`) contains one row per **member per plan enrollment**
+with ground-truth metadata:
 
 | Column | Description |
 |--------|-------------|
 | `MEME_CK` | Member key (joins to main CSV) |
 | `SBSB_CK` | Subscriber key |
-| `member_cluster` | Member cluster name (e.g., `young_professional`) |
-| `member_cluster_idx` | Member cluster numeric index (0-based) |
-| `group_cluster` | Group cluster name (e.g., `large_manufacturing`) |
-| `group_cluster_idx` | Group cluster numeric index (0-based) |
-| `age` | Sampled age value (before date conversion) |
-| `tenure_months` | Sampled tenure value (before date conversion) |
+| `GRGR_CK` | Group key |
+| `SGSG_CK` | Subgroup key |
+| `CSPD_CAT` | Plan category (M/D/V) |
+| `LOBD_ID` | Product/line of business |
+| `group_cluster` | Group-level cluster name |
+| `group_cluster_idx` | Group-level cluster index (0-based) |
+| `subgroup_cluster` | Subgroup-level cluster name |
+| `subgroup_cluster_idx` | Subgroup-level cluster index (0-based) |
+| `plan_cluster` | Plan-level cluster name |
+| `plan_cluster_idx` | Plan-level cluster index (0-based) |
+| `product_cluster` | Product-level cluster name |
+| `product_cluster_idx` | Product-level cluster index (0-based) |
+| `age` | Final blended age value |
+| `tenure_months` | Final blended tenure value |
 | `meme_rel` | Relationship code (M=subscriber, S=spouse, D=dependent) |
 
 This file is the answer key for validation. It is not part of the synthetic dataset
 itself.
+
+
+## Auto Mode
+
+Auto mode (`--auto`) generates the full hierarchy programmatically:
+
+- Creates `--auto-groups` groups (default: 6) with varied states and names
+- Each group gets 1-2 subgroups, each with 2-3 plans from [medical, dental, vision]
+- At each level, places `--auto-clusters-per-level` cluster centroids (default: 3)
+  with separation > 2 sigma in age x tenure space
+- **Group-level clusters** are unique per group with shifted base centroids
+- **Subgroup, plan, and product clusters** are shared across all instances for
+  globally comparable indices
+- Level weights default to `{group: 0.40, subgroup: 0.20, plan: 0.20, product: 0.20}`
+
+```bash
+python3 -m synthetic_generator generate --auto --auto-groups 8 --auto-clusters-per-level 4 --validate
+```
 
 
 ## Project Structure
@@ -476,10 +553,10 @@ CareSourcePoC/
 │   ├── __main__.py           # CLI entry point
 │   ├── engine.py             # SyntheticGenerator class and auto-config function
 │   ├── schema.py             # 56-column definitions, plan types, name pools
-│   ├── validate.py           # K-means cluster recovery validation
+│   ├── validate.py           # Hierarchical K-means cluster recovery validation
 │   ├── requirements.txt      # Python dependencies
 │   └── config/
-│       └── default.yaml      # Default cluster configuration
+│       └── default.yaml      # Default cluster configuration (6 groups, per-level clusters)
 ├── data/                     # Generated output (CSV, labels, plots)
 ├── docs/
 │   └── synthetic_generator.md
@@ -491,39 +568,17 @@ CareSourcePoC/
 
 ## Examples
 
-### Create a custom configuration with 7 member clusters
-
-Copy the default config and modify:
-
-```bash
-cp synthetic_generator/config/default.yaml synthetic_generator/config/custom.yaml
-# Edit custom.yaml: add member_clusters entries, adjust group_cluster weights
-python3 -m synthetic_generator generate \
-    --config synthetic_generator/config/custom.yaml \
-    --validate
-```
-
 ### Generate a large dataset for model training
 
 ```bash
 python3 -m synthetic_generator generate \
     --auto \
     --subscribers 5000 \
-    --auto-member-clusters 8 \
-    --auto-group-clusters 4 \
+    --auto-groups 10 \
+    --auto-clusters-per-level 4 \
     --seed 123 \
     --output data/large_dataset.csv \
     --validate
-```
-
-### Validate with a custom reference date
-
-```bash
-python3 -m synthetic_generator validate \
-    --data data/MEMBER_GROUP_PLAN_FLAT_generated.csv \
-    --labels data/MEMBER_GROUP_PLAN_FLAT_generated_labels.csv \
-    --reference-date 2025-06-01 \
-    --plot data/validation_plots.png
 ```
 
 ### Use the generator as a library
@@ -534,7 +589,8 @@ sys.path.insert(0, 'synthetic_generator')
 from engine import SyntheticGenerator, generate_auto_config
 
 # Auto mode
-config = generate_auto_config(seed=99, total_subscribers=200, n_member_clusters=4)
+config = generate_auto_config(seed=99, total_subscribers=200,
+                              n_groups=6, n_clusters_per_level=3)
 gen = SyntheticGenerator(config)
 df, labels = gen.generate()
 
@@ -546,7 +602,7 @@ gen = SyntheticGenerator(config)
 df, labels = gen.generate()
 
 # df is a pandas DataFrame with 56 columns
-# labels is a DataFrame with ground-truth cluster assignments
+# labels is a DataFrame with ground-truth cluster assignments at all 4 levels
 ```
 
 
@@ -569,3 +625,4 @@ logic in `facets_denorm_extraction.sql`:
 - Terminated enrollments have `SBSG_TERM_DT < 9999-12-31` and a non-empty
   `SBSG_MCTR_TRSN` (one of VTRM, NPAY, MOVE).
 - Reinstated enrollments start the day after the prior termination date.
+- A member's demographics are fixed once generated and do not change across plans.

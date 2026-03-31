@@ -19,8 +19,8 @@ def cmd_generate(args):
         config = generate_auto_config(
             seed=args.seed,
             total_subscribers=args.subscribers or 600,
-            n_member_clusters=args.auto_member_clusters,
-            n_group_clusters=args.auto_group_clusters,
+            n_groups=args.auto_groups,
+            n_clusters_per_level=args.auto_clusters_per_level,
         )
     else:
         config_path = args.config
@@ -68,7 +68,7 @@ def main():
     parser = argparse.ArgumentParser(
         prog='synthetic_generator',
         description='Generate synthetic MEMBER_GROUP_PLAN_FLAT data with '
-                    'embedded cluster structure.',
+                    'per-level embedded cluster structure.',
     )
     sub = parser.add_subparsers(dest='command')
 
@@ -79,10 +79,10 @@ def main():
         help='Path to YAML config (ignored if --auto)')
     gen_p.add_argument('--auto', action='store_true',
         help='Auto-select clusters and centroids instead of using config')
-    gen_p.add_argument('--auto-member-clusters', type=int, default=5,
-        help='Number of member clusters in auto mode (default: 5)')
-    gen_p.add_argument('--auto-group-clusters', type=int, default=3,
-        help='Number of group clusters in auto mode (default: 3)')
+    gen_p.add_argument('--auto-groups', type=int, default=6,
+        help='Number of explicit groups in auto mode (default: 6)')
+    gen_p.add_argument('--auto-clusters-per-level', type=int, default=3,
+        help='Number of member clusters per hierarchy level in auto mode (default: 3)')
     gen_p.add_argument('--seed', type=int, default=42)
     gen_p.add_argument('--subscribers', type=int, default=None,
         help='Total subscribers to generate (overrides config)')

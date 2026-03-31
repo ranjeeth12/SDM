@@ -1,22 +1,41 @@
 """Cluster recovery validation for synthetic MEMBER_GROUP_PLAN_FLAT data.
 
-Proves that the embedded cluster structure is recoverable from the raw data
-using standard unsupervised techniques (K-means, silhouette analysis).
+Proves that the embedded per-level cluster structure is recoverable from the raw
+data using standard unsupervised techniques (K-means, silhouette analysis).
 
-Validation runs at TWO levels:
-  1. Subscriber-level: filters to MEME_REL='M' (the independent unit of clustering).
-     Uses age + tenure as continuous features with one-hot categoricals.
-  2. Group-level: aggregates subscriber features per GRGR_CK and clusters groups.
+Validation has two dimensions:
+  1. ASSIGNMENT — ARI: did K-means assign points to the correct cluster?
+  2. DISTRIBUTION — per-feature: do recovered clusters match the generating
+     distributions?  Continuous features are compared with KS tests (two-sample
+     Kolmogorov–Smirnov); categorical features with total variation distance.
+
+Validation is HIERARCHICAL — each level is validated within a partition where all
+parent-level signals are constant:
+  1. Group-level: Cluster within each group → recover group-level clusters.
+  2. Subgroup-level: Within each (group, group_cluster) → recover subgroup clusters.
+  3. Plan-level: Within each (group, group_cl, sg_cl, CSPD_CAT) → recover plan.
+  4. Product-level: Within each (…, plan_cl, LOBD_ID) → recover product.
+  5. Composite: Cluster all subscribers globally with group identity as label.
 """
 
 import sys
 import numpy as np
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
+from scipy.stats import ks_2samp
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
-from sklearn.metrics import adjusted_rand_score, silhouette_score
+from sklearn.metrics import adjusted_rand_score, silhouette_score, confusion_matrix
 from sklearn.decomposition import PCA
 
+
+# ── Feature definitions ──────────────────────────────────────────────────
+
+CONTINUOUS_FEATURES = ['_age', '_tenure']
+CATEGORICAL_FEATURES = ['MEME_SEX', 'MEME_MARITAL_STATUS']
+
+
+# ── Data loading ─────────────────────────────────────────────────────────
 
 def load_and_prepare(data_path, labels_path, reference_date='2025-01-01'):
     """Load data and engineer features for clustering."""
@@ -30,75 +49,258 @@ def load_and_prepare(data_path, labels_path, reference_date='2025-01-01'):
 
     # Deduplicate to one row per member (plan expansion creates duplicates)
     members = df.drop_duplicates(subset=['MEME_CK'])[
-        ['MEME_CK', 'SBSB_CK', 'GRGR_CK', '_age', '_tenure',
-         'MEME_SEX', 'MEME_REL', 'MEME_MARITAL_STATUS']
+        ['MEME_CK', 'SBSB_CK', 'GRGR_CK', 'SGSG_CK', '_age', '_tenure',
+         'MEME_SEX', 'MEME_REL', 'MEME_MARITAL_STATUS', 'CSPD_CAT', 'LOBD_ID']
     ].copy()
 
-    # Align labels
-    member_labels = labels.drop_duplicates(subset=['MEME_CK']).set_index('MEME_CK')
+    member_labels = labels.drop_duplicates(subset=['MEME_CK'])
+    member_labels = member_labels.set_index('MEME_CK')
+    plan_labels = labels.copy()
+
     members = members.set_index('MEME_CK')
-    members = members.join(member_labels[['member_cluster_idx', 'member_cluster',
-                                           'group_cluster', 'group_cluster_idx']])
-    members = members.dropna(subset=['member_cluster_idx'])
-    members['member_cluster_idx'] = members['member_cluster_idx'].astype(int)
-    members['group_cluster_idx'] = members['group_cluster_idx'].astype(int)
+    label_cols = [
+        'GRGR_CK', 'SGSG_CK',
+        'group_cluster', 'group_cluster_idx',
+        'subgroup_cluster', 'subgroup_cluster_idx',
+        'plan_cluster', 'plan_cluster_idx',
+        'product_cluster', 'product_cluster_idx',
+    ]
+    available_cols = [c for c in label_cols if c in member_labels.columns]
+    join_cols = [c for c in available_cols if c not in members.columns]
+    members = members.join(member_labels[join_cols])
+    members = members.dropna(subset=['group_cluster_idx'])
 
-    return members
+    for col in members.columns:
+        if col.endswith('_idx'):
+            members[col] = members[col].astype(int)
+
+    return members, plan_labels
 
 
-def build_subscriber_features(subscribers):
-    """Build feature matrix for subscriber-level clustering.
+def build_feature_matrix(data, continuous_cols=None):
+    """Build feature matrix: standardized continuous (weighted 2x) + one-hot categoricals."""
+    if continuous_cols is None:
+        continuous_cols = CONTINUOUS_FEATURES
 
-    Uses continuous features (age, tenure) where the Gaussian structure lives,
-    plus one-hot categoricals (sex, marital status) for additional separation.
-    Continuous features are weighted 2x relative to categoricals since they
-    carry the primary cluster signal.
-    """
-    continuous = subscribers[['_age', '_tenure']].values
+    continuous = data[continuous_cols].values
     categoricals = pd.get_dummies(
-        subscribers[['MEME_SEX', 'MEME_MARITAL_STATUS']],
+        data[CATEGORICAL_FEATURES],
         dtype=float,
     ).values
 
     scaler = StandardScaler()
     cont_scaled = scaler.fit_transform(continuous)
-    # Weight continuous features more heavily (they carry the Gaussian signal)
     cont_weighted = cont_scaled * 2.0
     X = np.hstack([cont_weighted, categoricals])
     return X, scaler
 
 
-def build_group_features(members):
-    """Build feature matrix for group-level clustering.
+# ── Cluster alignment ────────────────────────────────────────────────────
 
-    Aggregates subscriber demographics per group to create group-level features:
-    mean age, mean tenure, age std, pct_male, pct_married, subscriber count.
+def _align_predictions(true_labels, pred_labels):
+    """Align predicted cluster indices to true labels using Hungarian algorithm.
+
+    Returns pred_aligned array where cluster IDs are remapped to best match
+    the true labels.
     """
-    subs = members[members['MEME_REL'] == 'M'].copy()
-    group_agg = subs.groupby('GRGR_CK').agg(
-        mean_age=('_age', 'mean'),
-        std_age=('_age', 'std'),
-        mean_tenure=('_tenure', 'mean'),
-        pct_male=('MEME_SEX', lambda x: (x == 'M').mean()),
-        pct_married=('MEME_MARITAL_STATUS', lambda x: (x == 'M').mean()),
-        sub_count=('SBSB_CK', 'nunique'),
-        group_cluster_idx=('group_cluster_idx', 'first'),
-        group_cluster=('group_cluster', 'first'),
-    ).reset_index()
-    group_agg['std_age'] = group_agg['std_age'].fillna(0)
+    unique_true = np.unique(true_labels)
+    unique_pred = np.unique(pred_labels)
+    cm = confusion_matrix(true_labels, pred_labels,
+                          labels=np.union1d(unique_true, unique_pred))
+    # Hungarian: maximize overlap (minimize -cm)
+    n = max(cm.shape)
+    padded = np.zeros((n, n), dtype=cm.dtype)
+    padded[:cm.shape[0], :cm.shape[1]] = cm
+    row_ind, col_ind = linear_sum_assignment(-padded)
 
-    feature_cols = ['mean_age', 'std_age', 'mean_tenure', 'pct_male',
-                    'pct_married', 'sub_count']
-    scaler = StandardScaler()
-    X = scaler.fit_transform(group_agg[feature_cols].values)
-    return X, group_agg
+    all_labels = np.union1d(unique_true, unique_pred)
+    mapping = {}
+    for r, c in zip(row_ind, col_ind):
+        if c < len(all_labels) and r < len(all_labels):
+            mapping[all_labels[c]] = all_labels[r]
 
+    pred_aligned = np.array([mapping.get(p, p) for p in pred_labels])
+    return pred_aligned
+
+
+# ── Per-feature distribution comparison ──────────────────────────────────
+
+def _compare_continuous(true_vals, recovered_vals):
+    """Compare continuous distributions. Returns dict with stats."""
+    ks_stat, ks_p = ks_2samp(true_vals, recovered_vals)
+    return {
+        'true_mean': float(np.mean(true_vals)),
+        'true_std': float(np.std(true_vals)),
+        'recov_mean': float(np.mean(recovered_vals)),
+        'recov_std': float(np.std(recovered_vals)),
+        'mean_err': float(abs(np.mean(true_vals) - np.mean(recovered_vals))),
+        'ks_stat': float(ks_stat),
+        'ks_p': float(ks_p),
+    }
+
+
+def _compare_categorical(true_series, recovered_series):
+    """Compare categorical distributions. Returns dict with stats."""
+    true_dist = true_series.value_counts(normalize=True).sort_index()
+    recov_dist = recovered_series.value_counts(normalize=True).sort_index()
+    all_vals = sorted(set(true_dist.index) | set(recov_dist.index))
+
+    true_probs = {v: true_dist.get(v, 0.0) for v in all_vals}
+    recov_probs = {v: recov_dist.get(v, 0.0) for v in all_vals}
+
+    # Total variation distance: 0.5 * sum |p - q|
+    tvd = 0.5 * sum(abs(true_probs[v] - recov_probs[v]) for v in all_vals)
+
+    return {
+        'true_dist': dict(true_probs),
+        'recov_dist': dict(recov_probs),
+        'tvd': float(tvd),
+    }
+
+
+def compare_cluster_distributions(data, true_labels, pred_aligned,
+                                  name_col=None):
+    """Per-cluster, per-feature comparison between true and recovered assignments.
+
+    Returns list of per-cluster result dicts.
+    """
+    cluster_results = []
+    for cl_idx in sorted(np.unique(true_labels)):
+        true_mask = true_labels == cl_idx
+        pred_mask = pred_aligned == cl_idx
+
+        if true_mask.sum() < 2 or pred_mask.sum() < 2:
+            continue
+
+        cl_name = None
+        if name_col and name_col in data.columns:
+            cl_name = data.loc[true_mask, name_col].iloc[0]
+
+        result = {
+            'cluster_idx': int(cl_idx),
+            'cluster_name': cl_name,
+            'true_n': int(true_mask.sum()),
+            'recov_n': int(pred_mask.sum()),
+            'continuous': {},
+            'categorical': {},
+        }
+
+        for feat in CONTINUOUS_FEATURES:
+            if feat in data.columns:
+                result['continuous'][feat] = _compare_continuous(
+                    data.loc[true_mask, feat].values,
+                    data.loc[pred_mask, feat].values,
+                )
+
+        for feat in CATEGORICAL_FEATURES:
+            if feat in data.columns:
+                result['categorical'][feat] = _compare_categorical(
+                    data.loc[true_mask, feat],
+                    data.loc[pred_mask, feat],
+                )
+
+        cluster_results.append(result)
+
+    return cluster_results
+
+
+def _print_distribution_report(cluster_results, indent='    '):
+    """Print a compact per-cluster distribution comparison report."""
+    for cr in cluster_results:
+        name = cr['cluster_name'] or f"cluster_{cr['cluster_idx']}"
+        print(f"{indent}{name}:  true_n={cr['true_n']}  recov_n={cr['recov_n']}")
+
+        for feat, stats in cr['continuous'].items():
+            label = feat.lstrip('_')
+            pass_fail = 'PASS' if stats['ks_p'] > 0.05 else 'FAIL'
+            print(f"{indent}  {label:>8}: "
+                  f"mean {stats['true_mean']:6.1f} -> {stats['recov_mean']:6.1f} "
+                  f"(err={stats['mean_err']:.1f})  "
+                  f"std {stats['true_std']:5.1f} -> {stats['recov_std']:5.1f}  "
+                  f"KS={stats['ks_stat']:.3f} p={stats['ks_p']:.3f} [{pass_fail}]")
+
+        for feat, stats in cr['categorical'].items():
+            dist_parts = []
+            for v in sorted(stats['true_dist'].keys()):
+                t = stats['true_dist'][v]
+                r = stats['recov_dist'].get(v, 0)
+                dist_parts.append(f"{v}:{t:.0%}->{r:.0%}")
+            pass_fail = 'PASS' if stats['tvd'] < 0.10 else 'FAIL'
+            print(f"{indent}  {feat:>8}: "
+                  f"{' '.join(dist_parts)}  "
+                  f"TVD={stats['tvd']:.3f} [{pass_fail}]")
+
+
+def aggregate_distribution_metrics(all_cluster_results):
+    """Aggregate per-feature metrics across all partitions.
+
+    Returns summary dict with mean KS p-values and TVDs per feature.
+    """
+    cont_metrics = {f: {'ks_stats': [], 'ks_ps': [], 'mean_errs': []}
+                    for f in CONTINUOUS_FEATURES}
+    cat_metrics = {f: {'tvds': []} for f in CATEGORICAL_FEATURES}
+
+    for cr in all_cluster_results:
+        for feat, stats in cr['continuous'].items():
+            cont_metrics[feat]['ks_stats'].append(stats['ks_stat'])
+            cont_metrics[feat]['ks_ps'].append(stats['ks_p'])
+            cont_metrics[feat]['mean_errs'].append(stats['mean_err'])
+        for feat, stats in cr['categorical'].items():
+            cat_metrics[feat]['tvds'].append(stats['tvd'])
+
+    summary = {}
+    for feat, m in cont_metrics.items():
+        if m['ks_ps']:
+            n_pass = sum(1 for p in m['ks_ps'] if p > 0.05)
+            summary[feat] = {
+                'type': 'continuous',
+                'mean_ks': float(np.mean(m['ks_stats'])),
+                'median_ks_p': float(np.median(m['ks_ps'])),
+                'mean_err': float(np.mean(m['mean_errs'])),
+                'ks_pass_rate': n_pass / len(m['ks_ps']),
+                'n_clusters': len(m['ks_ps']),
+            }
+    for feat, m in cat_metrics.items():
+        if m['tvds']:
+            n_pass = sum(1 for t in m['tvds'] if t < 0.10)
+            summary[feat] = {
+                'type': 'categorical',
+                'mean_tvd': float(np.mean(m['tvds'])),
+                'median_tvd': float(np.median(m['tvds'])),
+                'tvd_pass_rate': n_pass / len(m['tvds']),
+                'n_clusters': len(m['tvds']),
+            }
+    return summary
+
+
+# ── Core K-means + distribution validation ───────────────────────────────
+
+def _validate_partition(data, label_col, name_col=None, min_samples=8):
+    """Run K-means on a partition, return (ari, pred_aligned, cluster_results) or None."""
+    true_labels = data[label_col].values
+    n_true = len(np.unique(true_labels))
+
+    if n_true < 2 or len(data) < max(min_samples, n_true + 2):
+        return None
+
+    X, _ = build_feature_matrix(data)
+    km = KMeans(n_clusters=n_true, n_init=20, random_state=42, max_iter=500)
+    pred = km.fit_predict(X)
+    ari = adjusted_rand_score(true_labels, pred)
+    pred_aligned = _align_predictions(true_labels, pred)
+    cluster_results = compare_cluster_distributions(
+        data, true_labels, pred_aligned, name_col=name_col)
+
+    return ari, pred_aligned, cluster_results
+
+
+# ── Legacy helpers (kept for backward compat) ────────────────────────────
 
 def sweep_k(X, true_labels, k_range):
     """Run K-means for each k, compute silhouette and ARI."""
     results = []
     for k in k_range:
-        if k >= len(X):
+        if k >= len(X) or k < 2:
             continue
         km = KMeans(n_clusters=k, n_init=20, random_state=42, max_iter=500)
         pred = km.fit_predict(X)
@@ -137,14 +339,6 @@ def plot_clusters(X, true_labels, pred_labels, output_path, title_prefix=''):
     return output_path
 
 
-def _print_sweep(results, n_true):
-    print(f"  {'k':>4}  {'Silhouette':>11}  {'ARI':>7}")
-    print(f"  {'─' * 4}  {'─' * 11}  {'─' * 7}")
-    for _, r in results.iterrows():
-        marker = ' <-- true k' if int(r['k']) == n_true else ''
-        print(f"  {int(r['k']):>4}  {r['silhouette']:>11.4f}  {r['ari']:>7.4f}{marker}")
-
-
 def _quality_label(ari):
     if ari > 0.8: return 'EXCELLENT'
     if ari > 0.6: return 'GOOD'
@@ -152,88 +346,249 @@ def _quality_label(ari):
     return 'WEAK'
 
 
+def _weighted_mean(pairs):
+    """Compute size-weighted mean from list of (value, size) tuples."""
+    total_weight = sum(s for _, s in pairs)
+    if total_weight == 0:
+        return 0.0
+    return sum(a * s for a, s in pairs) / total_weight
+
+
+# Keep old name for backward compat
+_weighted_mean_ari = _weighted_mean
+
+
+# ── Main validation pipeline ─────────────────────────────────────────────
+
 def validate(data_path, labels_path, reference_date='2025-01-01',
              plot_path=None):
-    """Full validation pipeline. Returns results dict."""
-    members = load_and_prepare(data_path, labels_path, reference_date)
+    """Full hierarchical validation pipeline.
 
-    # ── Level 1: Subscriber-level clustering ─────────────────────
+    Returns dict with per-level results including ARI and distribution metrics.
+    """
+    members, plan_labels = load_and_prepare(data_path, labels_path, reference_date)
     subscribers = members[members['MEME_REL'] == 'M'].copy()
-    X_sub, _ = build_subscriber_features(subscribers)
-    true_sub_labels = subscribers['member_cluster_idx'].values
-    n_true_sub = len(np.unique(true_sub_labels))
 
-    print(f"\n{'=' * 60}")
-    print(f"  LEVEL 1: Subscriber-Level Cluster Recovery")
-    print(f"{'=' * 60}")
-    print(f"  Subscribers:       {len(subscribers)}")
-    print(f"  True clusters:     {n_true_sub}")
-    print(f"  Feature dims:      {X_sub.shape[1]}")
-    print(f"  Subscribers per cluster:")
-    for idx in sorted(np.unique(true_sub_labels)):
-        name = subscribers.loc[subscribers['member_cluster_idx'] == idx, 'member_cluster'].iloc[0]
-        count = (true_sub_labels == idx).sum()
-        print(f"    [{idx}] {name}: {count}")
+    results = {}
+    all_dist_results = []  # collect across all levels for global summary
 
-    k_lo = max(2, n_true_sub - 2)
-    k_hi = n_true_sub + 4
-    sub_results = sweep_k(X_sub, true_sub_labels, range(k_lo, k_hi + 1))
+    # ── Level 1: Group-level (within each group) ───────────────
+    print(f"\n{'=' * 70}")
+    print(f"  LEVEL 1: Group-Level Cluster Recovery (Within Groups)")
+    print(f"{'=' * 70}")
+    if 'group_cluster_idx' in subscribers.columns:
+        grp_aris = []
+        level_dist_results = []
+        for grgr_ck in sorted(subscribers['GRGR_CK'].unique()):
+            grp_subs = subscribers[subscribers['GRGR_CK'] == grgr_ck].copy()
+            result = _validate_partition(
+                grp_subs, 'group_cluster_idx', name_col='group_cluster')
+            if result is None:
+                continue
+            ari, pred_aligned, cluster_results = result
+            n_unique = len(grp_subs['group_cluster_idx'].unique())
+            grp_aris.append(ari)
+            level_dist_results.extend(cluster_results)
 
-    print(f"\n  K-Means Sweep (Subscribers):")
-    _print_sweep(sub_results, n_true_sub)
+            print(f"\n  Group {grgr_ck}: ARI = {ari:.4f} ({_quality_label(ari)}) "
+                  f"[{len(grp_subs)} subs, {n_unique} cl]")
+            _print_distribution_report(cluster_results)
 
-    best_row = sub_results.loc[sub_results['silhouette'].idxmax()]
-    true_k_ari = sub_results.loc[sub_results['k'] == n_true_sub, 'ari'].values[0]
+        if grp_aris:
+            mean_ari = np.mean(grp_aris)
+            results['group'] = {'ari': mean_ari}
+            all_dist_results.extend(level_dist_results)
+            print(f"\n  Mean group ARI: {mean_ari:.4f} ({_quality_label(mean_ari)}) "
+                  f"[{len(grp_aris)} groups]")
+        else:
+            print(f"  (No groups with multiple group clusters)")
 
-    print(f"\n  Best k by silhouette:  {int(best_row['k'])}")
-    print(f"  ARI at true k={n_true_sub}:      {true_k_ari:.4f}")
-    print(f"  Recovery quality:      {_quality_label(true_k_ari)}")
+    # ── Level 2: Subgroup-level ──────────────────────────────────
+    print(f"\n{'=' * 70}")
+    print(f"  LEVEL 2: Subgroup-Level Recovery")
+    print(f"  (within each group x group_cluster partition)")
+    print(f"{'=' * 70}")
+    if 'subgroup_cluster_idx' in subscribers.columns:
+        aris = []
+        level_dist_results = []
+        for keys, grp in subscribers.groupby(['GRGR_CK', 'group_cluster_idx']):
+            result = _validate_partition(
+                grp, 'subgroup_cluster_idx', name_col='subgroup_cluster',
+                min_samples=10)
+            if result is None:
+                continue
+            ari, pred_aligned, cluster_results = result
+            aris.append((ari, len(grp)))
+            level_dist_results.extend(cluster_results)
 
-    if plot_path:
-        km = KMeans(n_clusters=n_true_sub, n_init=20, random_state=42)
-        pred = km.fit_predict(X_sub)
-        sub_plot = plot_path.replace('.png', '_subscribers.png')
-        plot_clusters(X_sub, true_sub_labels, pred, sub_plot, 'Subscribers: ')
-        print(f"  Plot saved: {sub_plot}")
+            key_str = '/'.join(str(k) for k in keys)
+            n_unique = len(grp['subgroup_cluster_idx'].unique())
+            print(f"\n  {key_str}: ARI = {ari:.4f} ({_quality_label(ari)}) "
+                  f"[{len(grp)} subs, {n_unique} cl]")
+            _print_distribution_report(cluster_results)
 
-    # ── Level 2: Group-level clustering ──────────────────────────
-    X_grp, group_agg = build_group_features(members)
-    true_grp_labels = group_agg['group_cluster_idx'].values
-    n_true_grp = len(np.unique(true_grp_labels))
-    n_groups = len(group_agg)
+        if aris:
+            mean_ari = _weighted_mean(aris)
+            results['subgroup'] = {'ari': mean_ari}
+            all_dist_results.extend(level_dist_results)
+            print(f"\n  Weighted mean subgroup ARI: {mean_ari:.4f} "
+                  f"({_quality_label(mean_ari)}) [{len(aris)} partitions]")
+        else:
+            print(f"  (Insufficient data for subgroup validation)")
 
-    print(f"\n{'=' * 60}")
-    print(f"  LEVEL 2: Group-Level Cluster Recovery")
-    print(f"{'=' * 60}")
-    print(f"  Groups:            {n_groups}")
-    print(f"  True group clusters: {n_true_grp}")
-    print(f"  Groups per cluster:")
-    for idx in sorted(np.unique(true_grp_labels)):
-        name = group_agg.loc[group_agg['group_cluster_idx'] == idx, 'group_cluster'].iloc[0]
-        count = (true_grp_labels == idx).sum()
-        print(f"    [{idx}] {name}: {count}")
+    # ── Level 3: Plan-level ──────────────────────────────────────
+    print(f"\n{'=' * 70}")
+    print(f"  LEVEL 3: Plan-Level Recovery")
+    print(f"  (within group x group_cl x sg_cl x plan_type)")
+    print(f"{'=' * 70}")
+    if 'plan_cluster_idx' in plan_labels.columns:
+        plan_subs = plan_labels[plan_labels['meme_rel'] == 'M'].copy()
+        sub_features = subscribers[['GRGR_CK', 'SGSG_CK', '_age', '_tenure',
+                                     'MEME_SEX', 'MEME_MARITAL_STATUS',
+                                     'group_cluster_idx',
+                                     'subgroup_cluster_idx']].copy()
+        merged = plan_subs.set_index('MEME_CK').join(
+            sub_features, how='inner', rsuffix='_feat')
+        merged = merged.dropna(subset=['plan_cluster_idx'])
+        merged['plan_cluster_idx'] = merged['plan_cluster_idx'].astype(int)
 
-    if n_groups > n_true_grp + 1:
-        grp_k_lo = max(2, n_true_grp - 1)
-        grp_k_hi = min(n_groups - 1, n_true_grp + 3)
-        grp_results = sweep_k(X_grp, true_grp_labels, range(grp_k_lo, grp_k_hi + 1))
-        print(f"\n  K-Means Sweep (Groups):")
-        _print_sweep(grp_results, n_true_grp)
-        grp_ari = grp_results.loc[grp_results['k'] == n_true_grp, 'ari'].values[0] if n_true_grp in grp_results['k'].values else 0
-        print(f"\n  ARI at true k={n_true_grp}:      {grp_ari:.4f}")
-        print(f"  Recovery quality:      {_quality_label(grp_ari)}")
+        aris = []
+        level_dist_results = []
+        partition_cols = ['GRGR_CK', 'group_cluster_idx',
+                          'subgroup_cluster_idx', 'CSPD_CAT']
+        for keys, grp in merged.groupby(partition_cols):
+            result = _validate_partition(
+                grp, 'plan_cluster_idx', name_col='plan_cluster',
+                min_samples=15)
+            if result is None:
+                continue
+            ari, pred_aligned, cluster_results = result
+            aris.append((ari, len(grp)))
+            level_dist_results.extend(cluster_results)
 
-        if plot_path:
-            km_g = KMeans(n_clusters=n_true_grp, n_init=20, random_state=42)
-            pred_g = km_g.fit_predict(X_grp)
-            grp_plot = plot_path.replace('.png', '_groups.png')
-            plot_clusters(X_grp, true_grp_labels, pred_g, grp_plot, 'Groups: ')
-            print(f"  Plot saved: {grp_plot}")
-    else:
-        print(f"  (Too few groups for K-means sweep)")
+            key_str = '/'.join(str(k) for k in keys)
+            n_unique = len(grp['plan_cluster_idx'].unique())
+            print(f"  {key_str}: ARI = {ari:.4f} ({_quality_label(ari)}) "
+                  f"[{len(grp)} subs, {n_unique} cl]")
 
+        if aris:
+            mean_ari = _weighted_mean(aris)
+            results['plan'] = {'ari': mean_ari}
+            all_dist_results.extend(level_dist_results)
+            print(f"\n  Weighted mean plan ARI: {mean_ari:.4f} "
+                  f"({_quality_label(mean_ari)}) [{len(aris)} partitions]")
+        else:
+            print(f"  (Insufficient data for plan-level validation)")
+
+    # ── Level 4: Product-level ───────────────────────────────────
+    print(f"\n{'=' * 70}")
+    print(f"  LEVEL 4: Product-Level Recovery")
+    print(f"  (within group x group_cl x sg_cl x plan_cl x LOBD_ID)")
+    print(f"{'=' * 70}")
+    if 'product_cluster_idx' in plan_labels.columns:
+        plan_subs = plan_labels[plan_labels['meme_rel'] == 'M'].copy()
+        sub_features = subscribers[['GRGR_CK', 'SGSG_CK', '_age', '_tenure',
+                                     'MEME_SEX', 'MEME_MARITAL_STATUS',
+                                     'group_cluster_idx',
+                                     'subgroup_cluster_idx']].copy()
+        merged = plan_subs.set_index('MEME_CK').join(
+            sub_features, how='inner', rsuffix='_feat')
+        merged = merged.dropna(subset=['product_cluster_idx'])
+        merged['product_cluster_idx'] = merged['product_cluster_idx'].astype(int)
+        merged['plan_cluster_idx'] = merged['plan_cluster_idx'].astype(int)
+
+        aris = []
+        level_dist_results = []
+        partition_cols = ['GRGR_CK', 'group_cluster_idx',
+                          'subgroup_cluster_idx', 'plan_cluster_idx', 'LOBD_ID']
+        for keys, grp in merged.groupby(partition_cols):
+            result = _validate_partition(
+                grp, 'product_cluster_idx', name_col='product_cluster',
+                min_samples=8)
+            if result is None:
+                continue
+            ari, pred_aligned, cluster_results = result
+            aris.append((ari, len(grp)))
+            level_dist_results.extend(cluster_results)
+
+            key_str = '/'.join(str(k) for k in keys)
+            n_unique = len(grp['product_cluster_idx'].unique())
+            print(f"  {key_str}: ARI = {ari:.4f} ({_quality_label(ari)}) "
+                  f"[{len(grp)} subs, {n_unique} cl]")
+
+        if aris:
+            mean_ari = _weighted_mean(aris)
+            results['product'] = {'ari': mean_ari}
+            all_dist_results.extend(level_dist_results)
+            print(f"\n  Weighted mean product ARI: {mean_ari:.4f} "
+                  f"({_quality_label(mean_ari)}) [{len(aris)} partitions]")
+        else:
+            print(f"  (Insufficient data for product-level validation)")
+
+    # ── Level 5: Composite (global by group identity) ──────────
+    print(f"\n{'=' * 70}")
+    print(f"  LEVEL 5: Composite (Global — recover group identity)")
+    print(f"{'=' * 70}")
+    n_groups = subscribers['GRGR_CK'].nunique()
+    if n_groups >= 2:
+        result = _validate_partition(subscribers, 'GRGR_CK')
+        if result is not None:
+            ari, pred_aligned, _ = result
+            results['composite'] = {'ari': ari}
+            print(f"  Groups: {n_groups}")
+            print(f"  ARI = {ari:.4f} ({_quality_label(ari)})")
+
+            if plot_path:
+                X, _ = build_feature_matrix(subscribers)
+                km = KMeans(n_clusters=n_groups, n_init=20, random_state=42)
+                pred = km.fit_predict(X)
+                pf = plot_path.replace('.png', '_composite.png')
+                plot_clusters(X, subscribers['GRGR_CK'].values, pred, pf,
+                              'Composite: ')
+                print(f"  Plot saved: {pf}")
+
+    # ── Distribution Summary ──────────────────────────────────────
+    print(f"\n{'=' * 70}")
+    print(f"  DISTRIBUTION RECOVERY (all levels, all partitions)")
+    print(f"{'=' * 70}")
+    if all_dist_results:
+        dist_summary = aggregate_distribution_metrics(all_dist_results)
+        for feat, stats in sorted(dist_summary.items()):
+            if stats['type'] == 'continuous':
+                label = feat.lstrip('_')
+                pass_rate = stats['ks_pass_rate']
+                grade = ('EXCELLENT' if pass_rate > 0.90 else
+                         'GOOD' if pass_rate > 0.75 else
+                         'MODERATE' if pass_rate > 0.50 else 'WEAK')
+                print(f"  {label:>18}:  KS pass rate = {pass_rate:.0%} "
+                      f"({stats['n_clusters']} clusters)  "
+                      f"mean |err| = {stats['mean_err']:.1f}  "
+                      f"median KS p = {stats['median_ks_p']:.3f}  [{grade}]")
+            else:
+                pass_rate = stats['tvd_pass_rate']
+                grade = ('EXCELLENT' if pass_rate > 0.90 else
+                         'GOOD' if pass_rate > 0.75 else
+                         'MODERATE' if pass_rate > 0.50 else 'WEAK')
+                print(f"  {feat:>18}:  TVD pass rate = {pass_rate:.0%} "
+                      f"({stats['n_clusters']} clusters)  "
+                      f"mean TVD = {stats['mean_tvd']:.3f}  "
+                      f"median TVD = {stats['median_tvd']:.3f}  [{grade}]")
+
+        results['distribution'] = dist_summary
+
+    # ── Assignment Summary ────────────────────────────────────────
+    print(f"\n{'=' * 70}")
+    print(f"  ASSIGNMENT RECOVERY (ARI)")
+    print(f"{'=' * 70}")
+    for level in ['group', 'subgroup', 'plan', 'product', 'composite']:
+        if level in results and 'ari' in results[level]:
+            ari = results[level]['ari']
+            print(f"  {level:>12}:  ARI = {ari:.4f}  ({_quality_label(ari)})")
+        else:
+            print(f"  {level:>12}:  (skipped)")
     print()
-    return sub_results
+
+    return results
 
 
 def main():

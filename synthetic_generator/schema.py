@@ -26,24 +26,17 @@ COLUMNS = [
     'CSPD_CAT_DESC', 'CSPD_TYPE',
     # Product / LOB (CMC_PDPD_PRODUCT)
     'LOBD_ID', 'PDPD_RISK_IND', 'PDPD_MCTR_CCAT',
+    # Plan / Product descriptions (from joined lookups)
+    'PLDS_DESC', 'PDDS_DESC',
 ]
 
-assert len(COLUMNS) == 56, f"Expected 56 columns, got {len(COLUMNS)}"
+assert len(COLUMNS) == 58, f"Expected 58 columns, got {len(COLUMNS)}"
 
 # Plan type lookup (CSPD_CAT -> attributes)
 PLAN_TYPES = {
-    'medical': {
-        'cspd_cat': 'M', 'cspd_cat_desc': 'Medical', 'cspd_type': 'M',
-        'lobd_id': 'MED', 'has_hios': True,
-    },
-    'dental': {
-        'cspd_cat': 'D', 'cspd_cat_desc': 'Dental', 'cspd_type': 'D',
-        'lobd_id': 'DEN', 'has_hios': False,
-    },
-    'vision': {
-        'cspd_cat': 'V', 'cspd_cat_desc': 'Vision', 'cspd_type': 'V',
-        'lobd_id': 'VIS', 'has_hios': False,
-    },
+    'M': {'cspd_cat': 'M', 'cspd_cat_desc': 'Medical Product', 'cspd_type': ''},
+    'D': {'cspd_cat': 'D', 'cspd_cat_desc': 'Dental Product', 'cspd_type': ''},
+    'C': {'cspd_cat': 'C', 'cspd_cat_desc': 'Case Management', 'cspd_type': ''},
 }
 
 # Name pools for synthetic generation

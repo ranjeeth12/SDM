@@ -1,5 +1,14 @@
-"""Core generation engine for MEMBER_GROUP_PLAN_FLAT synthetic data."""
+"""Core generation engine for MEMBER_GROUP_PLAN_FLAT synthetic data.
 
+Uses per-level member clustering: each hierarchy level (group, subgroup, plan,
+product) defines its own member clusters. A member's final demographics are a
+weighted blend of independent samples from each level's cluster.
+
+Lookup tables from data/lookups_joined/ provide real CareSource group, subgroup,
+and plan identity fields. Member demographics remain synthetic.
+"""
+
+import os
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -9,9 +18,40 @@ from schema import (
     CHILD_MALE, CHILD_FEMALE, MID_INITIALS, RACE_CODES, ETHN_CODES,
 )
 
+# Path to lookup parquets (relative to repo root)
+_LOOKUPS_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'lookups_joined')
+
+
+def _load_lookups():
+    """Load lookup parquets. Returns (plans_df, subgroups_df)."""
+    plans_path = os.path.join(_LOOKUPS_DIR, 'plans.parquet')
+    subgroups_path = os.path.join(_LOOKUPS_DIR, 'subgroups.parquet')
+    plans = pd.read_parquet(plans_path)
+    subgroups = pd.read_parquet(subgroups_path)
+    return plans, subgroups
+
+
+def _parse_dt(val):
+    """Parse a date value from parquet (may be string or Timestamp) to datetime."""
+    if pd.isna(val):
+        return datetime(9999, 12, 31)
+    if isinstance(val, str):
+        # Handle '9999-12-31 00:00:00' or '2003-07-01' etc.
+        return datetime.strptime(val[:10], '%Y-%m-%d')
+    if hasattr(val, 'to_pydatetime'):
+        return val.to_pydatetime().replace(tzinfo=None)
+    return datetime(9999, 12, 31)
+
+
+def _safe_str(val, default=''):
+    """Convert a parquet value to str, handling NaN/None."""
+    if pd.isna(val) or val is None:
+        return default
+    return str(val).strip()
+
 
 class SyntheticGenerator:
-    """Generates synthetic MEMBER_GROUP_PLAN_FLAT data with embedded cluster structure."""
+    """Generates synthetic MEMBER_GROUP_PLAN_FLAT data with per-level cluster structure."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -19,43 +59,76 @@ class SyntheticGenerator:
         self.ref_date = datetime.strptime(
             config.get('reference_date', '2025-01-01'), '%Y-%m-%d'
         )
+        self.level_weights = config.get('level_weights', {
+            'group': 0.40, 'subgroup': 0.20, 'plan': 0.20, 'product': 0.20,
+        })
         self._meme_ck = 5001
         self._sbsb_ck = 3001
-        self._grgr_ck = 1001
-        self._sgsg_ck = 2001
         self._ssn = 900000001
+
+        # Load real lookup tables
+        self.plans_lookup, self.subgroups_lookup = _load_lookups()
 
     def generate(self):
         """Generate the full dataset. Returns (data_df, labels_df)."""
-        groups = self._build_groups()
-        member_clusters = self.config['member_clusters']
-        plan_profiles = self.config['plan_profiles']
+        hierarchy = self._parse_hierarchy()
         enrollment_cfg = self.config.get('enrollment', {})
+        plan_enroll_weights = self.config.get('plan_enrollment_weights', {
+            'M': 1.0, 'D': 0.60, 'C': 0.30,
+        })
         total_subs = self.config.get('total_subscribers', 500)
 
-        # Distribute subscribers across groups proportional to group subscriber_count
-        group_capacities = np.array([g['target_subs'] for g in groups], dtype=float)
+        # Distribute subscribers across groups proportional to target_subscribers
+        group_capacities = np.array(
+            [g['target_subscribers'] for g in hierarchy], dtype=float)
         group_probs = group_capacities / group_capacities.sum()
 
         all_rows = []
         all_labels = []
 
         for _ in range(total_subs):
-            # Pick group
-            g_idx = self.rng.choice(len(groups), p=group_probs)
-            group = groups[g_idx]
+            # a) Pick group
+            g_idx = self.rng.choice(len(hierarchy), p=group_probs)
+            group = hierarchy[g_idx]
 
-            # Pick member cluster using group-specific weights
-            weights = np.array(group['member_cluster_weights'])
-            cluster_idx = self.rng.choice(len(member_clusters), p=weights)
-            cluster = member_clusters[cluster_idx]
+            # b) Pick subgroup (equal weight)
+            subgroups = group['subgroups']
+            sg_idx = self.rng.integers(len(subgroups))
+            subgroup = subgroups[sg_idx]
 
-            # Generate subscriber
+            # c) Pick primary plan (M first if available)
+            plans = subgroup['plans']
+            primary_plan = None
+            for p in plans:
+                if p['type'] == 'M':
+                    primary_plan = p
+                    break
+            if primary_plan is None:
+                primary_plan = plans[0]
+
+            # d) Get product from primary plan
+            primary_product = primary_plan['products'][0]
+
+            # e) Pick a cluster independently at each level
+            gc_idx, gc = self._pick_cluster(group['member_clusters'])
+            sgc_idx, sgc = self._pick_cluster(subgroup['member_clusters'])
+            pc_idx, pc = self._pick_cluster(primary_plan['member_clusters'])
+            prc_idx, prc = self._pick_cluster(primary_product['member_clusters'])
+
+            cluster_picks = {
+                'group': gc, 'subgroup': sgc, 'plan': pc, 'product': prc,
+            }
+
+            # f) Blend continuous attributes
+            sub_age = self._blend_continuous(cluster_picks, 'age', 18, 70)
+            sub_tenure = self._blend_continuous(cluster_picks, 'tenure_months', 1, 360)
+
+            # g) Blend categorical attributes
+            sub_sex = self._blend_categorical(cluster_picks, 'meme_sex')
+            sub_marital = self._blend_categorical(cluster_picks, 'meme_marital_status')
+
+            # Generate subscriber identity
             sbsb_ck = self._next_sbsb_ck()
-            sub_age = self._sample_gaussian_clipped(cluster['continuous']['age'], 18, 70)
-            sub_tenure = self._sample_gaussian_clipped(cluster['continuous']['tenure_months'], 1, 360)
-            sub_sex = self._sample_categorical(cluster['categorical']['meme_sex'])
-            sub_marital = self._sample_categorical(cluster['categorical']['meme_marital_status'])
             sub_last = self.rng.choice(LAST_NAMES)
             sub_first = self.rng.choice(MALE_FIRST if sub_sex == 'M' else FEMALE_FIRST)
             sub_mid = self.rng.choice(MID_INITIALS)
@@ -76,7 +149,8 @@ class SyntheticGenerator:
                 'sbsb_employ_id': f'EMP{sbsb_ck:06d}',
             }
 
-            # Build family members list
+            # h) Generate family from group-level cluster's family config
+            family_cfg = gc.get('family', {})
             family = [self._make_member(
                 meme_ck=sub_meme_ck, sbsb_ck=sbsb_ck, sfx=1, rel='M',
                 last_name=sub_last, first_name=sub_first, mid_init=sub_mid,
@@ -84,18 +158,15 @@ class SyntheticGenerator:
                 eff_dt=sub_eff_dt, marital=sub_marital,
                 race=sub_race, ethn=sub_ethn,
                 age=sub_age, tenure=sub_tenure,
-                cluster_name=cluster['name'], cluster_idx=cluster_idx,
-                group_cluster=group['group_cluster_name'],
             )]
 
             sfx = 2
-            family_cfg = cluster.get('family', {})
-
             # Spouse
             if self.rng.random() < family_cfg.get('spouse_prob', 0):
                 sp_sex = 'F' if sub_sex == 'M' else 'M'
                 sp_age = max(18, sub_age + self.rng.normal(0, 3))
-                sp_first = self.rng.choice(MALE_FIRST if sp_sex == 'M' else FEMALE_FIRST)
+                sp_first = self.rng.choice(
+                    MALE_FIRST if sp_sex == 'M' else FEMALE_FIRST)
                 family.append(self._make_member(
                     meme_ck=self._next_meme_ck(), sbsb_ck=sbsb_ck, sfx=sfx, rel='S',
                     last_name=sub_last, first_name=sp_first,
@@ -104,8 +175,6 @@ class SyntheticGenerator:
                     ssn=self._next_ssn(), eff_dt=sub_eff_dt, marital='M',
                     race=sub_race, ethn=sub_ethn,
                     age=sp_age, tenure=sub_tenure,
-                    cluster_name=cluster['name'], cluster_idx=cluster_idx,
-                    group_cluster=group['group_cluster_name'],
                 ))
                 sfx += 1
 
@@ -128,141 +197,259 @@ class SyntheticGenerator:
                     ssn=self._next_ssn(), eff_dt=sub_eff_dt, marital='S',
                     race=sub_race, ethn=sub_ethn,
                     age=ch_age, tenure=sub_tenure,
-                    cluster_name=cluster['name'], cluster_idx=cluster_idx,
-                    group_cluster=group['group_cluster_name'],
                 ))
                 sfx += 1
 
-            # Determine plans for this family
-            plan_pref = cluster.get('plan_preference', 'medical_only')
-            preferred_plans = plan_profiles.get(plan_pref, ['medical'])
-            available_plans = group['subgroup']['plans']
-            active_plans = [p for p in preferred_plans if p in available_plans]
+            # i) Determine additional plan enrollments via plan_enrollment_weights
+            active_plans = []
+            for plan in plans:
+                ptype = plan['type']
+                weight = plan_enroll_weights.get(ptype, 0.5)
+                if ptype == primary_plan['type'] or self.rng.random() < weight:
+                    active_plans.append(plan)
             if not active_plans:
-                active_plans = [available_plans[0]]
+                active_plans = [primary_plan]
 
-            # Generate enrollment periods
+            # j) For each active plan, pick plan/product clusters (for labels only)
+            plan_cluster_map = {}
+            for plan in active_plans:
+                product = plan['products'][0]
+                if plan is primary_plan:
+                    plan_cluster_map[plan['type']] = {
+                        'plan_cluster': pc['name'],
+                        'plan_cluster_idx': pc_idx,
+                        'product_cluster': prc['name'],
+                        'product_cluster_idx': prc_idx,
+                        'lobd_id': product['lobd_id'],
+                        'plan_detail': plan['plan_detail'],
+                    }
+                else:
+                    alt_pc_idx, alt_pc = self._pick_cluster(plan['member_clusters'])
+                    alt_prc_idx, alt_prc = self._pick_cluster(
+                        product['member_clusters'])
+                    plan_cluster_map[plan['type']] = {
+                        'plan_cluster': alt_pc['name'],
+                        'plan_cluster_idx': alt_pc_idx,
+                        'product_cluster': alt_prc['name'],
+                        'product_cluster_idx': alt_prc_idx,
+                        'lobd_id': product['lobd_id'],
+                        'plan_detail': plan['plan_detail'],
+                    }
+
+            # k) Generate enrollment periods
             enrollment_periods = self._generate_enrollments(sub_eff_dt, enrollment_cfg)
 
-            # Expand: member × enrollment_period × plan
-            sg = group['subgroup']
+            # l) Expand: member x enrollment_period x enrolled_plans -> rows
             for member in family:
                 for eff_dt, term_dt, trsn in enrollment_periods:
-                    for plan_name in active_plans:
+                    for plan in active_plans:
+                        ptype = plan['type']
+                        pd_detail = plan_cluster_map[ptype]['plan_detail']
                         row = self._build_row(
-                            member, subscriber_info, group, sg,
-                            eff_dt, term_dt, trsn, plan_name,
+                            member, subscriber_info, group, subgroup,
+                            eff_dt, term_dt, trsn, pd_detail,
                         )
                         all_rows.append(row)
 
-                all_labels.append({
-                    'MEME_CK': member['meme_ck'],
-                    'SBSB_CK': sbsb_ck,
-                    'member_cluster': cluster['name'],
-                    'member_cluster_idx': cluster_idx,
-                    'group_cluster': group['group_cluster_name'],
-                    'group_cluster_idx': group['group_cluster_idx'],
-                    'age': member['age'],
-                    'tenure_months': member['tenure'],
-                    'meme_rel': member['rel'],
-                })
+                # m) Record labels with cluster assignment at ALL four levels
+                for plan in active_plans:
+                    ptype = plan['type']
+                    pcm = plan_cluster_map[ptype]
+                    all_labels.append({
+                        'MEME_CK': member['meme_ck'],
+                        'SBSB_CK': sbsb_ck,
+                        'GRGR_CK': group['grgr_ck'],
+                        'SGSG_CK': subgroup['sgsg_ck'],
+                        'CSPD_CAT': ptype,
+                        'LOBD_ID': pcm['lobd_id'],
+                        'group_cluster': gc['name'],
+                        'group_cluster_idx': gc_idx,
+                        'subgroup_cluster': sgc['name'],
+                        'subgroup_cluster_idx': sgc_idx,
+                        'plan_cluster': pcm['plan_cluster'],
+                        'plan_cluster_idx': pcm['plan_cluster_idx'],
+                        'product_cluster': pcm['product_cluster'],
+                        'product_cluster_idx': pcm['product_cluster_idx'],
+                        'age': member['age'],
+                        'tenure_months': member['tenure'],
+                        'meme_rel': member['rel'],
+                    })
 
         df = pd.DataFrame(all_rows, columns=COLUMNS)
         labels_df = pd.DataFrame(all_labels)
         return df, labels_df
 
-    # ── Group Building ───────────────────────────────────────────────
+    # -- Hierarchy Parsing (uses real lookup tables) --------------------
 
-    def _build_groups(self):
-        """Build group records from group_clusters config."""
-        group_clusters = self.config['group_clusters']
-        prefixes = list(self.config.get('group_name_prefixes', ['Group']))
-        self.rng.shuffle(prefixes)
-        prefix_idx = 0
-        groups = []
+    def _parse_hierarchy(self):
+        """Parse config into hierarchy using real lookup tables for identity fields."""
+        groups_cfg = self.config['groups']
+        hierarchy = []
 
-        for gc_idx, gc in enumerate(group_clusters):
-            count = gc.get('count', 3)
-            attrs = gc['attributes']
-            templates = gc.get('name_templates', ['{prefix} Corp'])
+        for g_cfg in groups_cfg:
+            grgr_ck = g_cfg['grgr_ck']
 
-            for i in range(count):
-                grgr_ck = self._next_grgr_ck()
-                prefix = prefixes[prefix_idx % len(prefixes)]
-                prefix_idx += 1
-                template = templates[i % len(templates)]
-                grgr_name = template.format(prefix=prefix)
+            # Look up group identity from plans_lookup (one row per group is enough)
+            grp_rows = self.plans_lookup[self.plans_lookup['GRGR_CK'] == grgr_ck]
+            if len(grp_rows) == 0:
+                raise ValueError(f"GRGR_CK={grgr_ck} not found in plans lookup")
+            grp_ref = grp_rows.iloc[0]
 
-                orig_year = int(round(self._sample_gaussian_clipped(
-                    attrs['grgr_orig_year'], 2010, 2024)))
-                orig_dt = datetime(orig_year, 1, 1)
+            group = {
+                'grgr_ck': int(grgr_ck),
+                'grgr_id': _safe_str(grp_ref['GRGR_ID']),
+                'grgr_name': _safe_str(grp_ref['GRGR_NAME']),
+                'grgr_state': _safe_str(grp_ref['GRGR_STATE'], 'OH'),
+                'grgr_county': _safe_str(grp_ref['GRGR_COUNTY']),
+                'grgr_sts': _safe_str(grp_ref['GRGR_STS'], 'AC'),
+                'grgr_orig_eff_dt': _parse_dt(grp_ref['GRGR_ORIG_EFF_DT']),
+                'grgr_term_dt': _parse_dt(grp_ref['GRGR_TERM_DT']),
+                'grgr_mctr_type': _safe_str(grp_ref['GRGR_MCTR_TYPE'], 'MDCD'),
+                'pagr_ck': int(grp_ref['PAGR_CK']) if not pd.isna(grp_ref['PAGR_CK']) else 0,
+                'target_subscribers': g_cfg.get('target_subscribers', 50),
+                'member_clusters': g_cfg.get('member_clusters', []),
+                'subgroups': [],
+            }
 
-                target_subs = max(10, int(round(
-                    self.rng.normal(attrs['subscriber_count']['mean'],
-                                    attrs['subscriber_count']['std']))))
+            # Parse subgroups
+            for sg_cfg in g_cfg.get('subgroups', []):
+                sgsg_ck = sg_cfg['sgsg_ck']
 
-                # Build member_cluster_weights aligned to member_clusters order
-                mc_names = [mc['name'] for mc in self.config['member_clusters']]
-                weight_map = gc.get('member_cluster_weights', {})
-                mc_weights = np.array([weight_map.get(n, 0.0) for n in mc_names])
-                if mc_weights.sum() == 0:
-                    mc_weights = np.ones(len(mc_names))
-                mc_weights = mc_weights / mc_weights.sum()
+                # Look up subgroup identity from subgroups_lookup
+                sg_rows = self.subgroups_lookup[
+                    self.subgroups_lookup['SGSG_CK'] == sgsg_ck
+                ]
+                if len(sg_rows) == 0:
+                    raise ValueError(
+                        f"SGSG_CK={sgsg_ck} not found in subgroups lookup"
+                    )
+                sg_ref = sg_rows.iloc[0]
 
-                # Build subgroup and plan details
-                sg_cfg = gc.get('subgroup', {'plans': ['medical']})
-                sgsg_ck = self._next_sgsg_ck()
-                plan_details = {}
-                for k, plan_name in enumerate(sg_cfg['plans']):
-                    pt = PLAN_TYPES[plan_name]
-                    cspi_id = f'CSPI{grgr_ck % 100:02d}{k+1:02d}'
-                    pdpd_id = f'{pt["lobd_id"]}P{grgr_ck % 100:02d}{k+1:02d}'
-                    hios = f'12345{attrs["grgr_state"]}{grgr_ck % 100:03d}{k+1:04d}' if pt['has_hios'] else ''
-                    plan_details[plan_name] = {
+                subgroup = {
+                    'sgsg_ck': int(sgsg_ck),
+                    'sgsg_id': _safe_str(sg_ref['SGSG_ID']),
+                    'sgsg_name': _safe_str(sg_ref['SGSG_NAME']),
+                    'cscs_id': _safe_str(sg_ref['CSCS_ID']),
+                    'sgsg_state': _safe_str(sg_ref['SGSG_STATE'], 'OH'),
+                    'sgsg_sts': _safe_str(sg_ref['SGSG_STS'], 'AC'),
+                    'sgsg_orig_eff_dt': _parse_dt(sg_ref['SGSG_ORIG_EFF_DT']),
+                    'sgsg_term_dt': _parse_dt(sg_ref['SGSG_TERM_DT']),
+                    'member_clusters': sg_cfg.get('member_clusters', []),
+                    'plans': [],
+                }
+
+                # Parse plans
+                for plan_cfg in sg_cfg.get('plans', []):
+                    cspi_id = plan_cfg['cspi_id']
+
+                    # Look up plan from plans_lookup
+                    plan_rows = self.plans_lookup[
+                        (self.plans_lookup['GRGR_CK'] == grgr_ck) &
+                        (self.plans_lookup['CSPI_ID'] == cspi_id)
+                    ]
+                    if len(plan_rows) == 0:
+                        raise ValueError(
+                            f"CSPI_ID={cspi_id} not found for GRGR_CK={grgr_ck}"
+                        )
+                    pl_ref = plan_rows.iloc[0]
+
+                    cspd_cat = _safe_str(pl_ref['CSPD_CAT'])
+                    lobd_id = _safe_str(pl_ref['LOBD_ID'])
+
+                    plan_detail = {
                         'cspi_id': cspi_id,
-                        'cspd_cat': pt['cspd_cat'],
-                        'cspi_eff_dt': orig_dt,
-                        'cspi_term_dt': datetime(9999, 12, 31),
-                        'pdpd_id': pdpd_id,
-                        'cspi_sel_ind': 'Y',
-                        'cspi_hios_id_nvl': hios,
-                        'cspd_cat_desc': pt['cspd_cat_desc'],
-                        'cspd_type': pt['cspd_type'],
-                        'lobd_id': pt['lobd_id'],
+                        'cspd_cat': cspd_cat,
+                        'cspi_eff_dt': _parse_dt(pl_ref['CSPI_EFF_DT']),
+                        'cspi_term_dt': _parse_dt(pl_ref['CSPI_TERM_DT']),
+                        'pdpd_id': _safe_str(pl_ref['PDPD_ID']),
+                        'cspi_sel_ind': _safe_str(pl_ref['CSPI_SEL_IND'], 'Y'),
+                        'cspi_hios_id_nvl': _safe_str(pl_ref.get('CSPI_HIOS_ID_NVL', '')),
+                        'cspd_cat_desc': _safe_str(pl_ref['CSPD_CAT_DESC']),
+                        'cspd_type': _safe_str(pl_ref['CSPD_TYPE']),
+                        'lobd_id': lobd_id,
+                        'pdpd_risk_ind': _safe_str(pl_ref['PDPD_RISK_IND'], 'N'),
+                        'pdpd_mctr_ccat': _safe_str(pl_ref['PDPD_MCTR_CCAT'], ''),
+                        'plds_desc': _safe_str(pl_ref.get('PLDS_DESC', '')),
+                        'pdds_desc': _safe_str(pl_ref.get('PDDS_DESC', '')),
                     }
 
-                groups.append({
-                    'grgr_ck': grgr_ck,
-                    'grgr_id': f'GRP{grgr_ck:05d}',
-                    'grgr_name': grgr_name,
-                    'grgr_state': attrs['grgr_state'],
-                    'grgr_county': attrs['grgr_county'],
-                    'grgr_sts': 'AC',
-                    'grgr_orig_eff_dt': orig_dt,
-                    'grgr_term_dt': datetime(9999, 12, 31),
-                    'grgr_mctr_type': attrs['grgr_mctr_type'],
-                    'pagr_ck': 0,
-                    'target_subs': target_subs,
-                    'member_cluster_weights': mc_weights,
-                    'group_cluster_name': gc['name'],
-                    'group_cluster_idx': gc_idx,
-                    'subgroup': {
-                        'sgsg_ck': sgsg_ck,
-                        'sgsg_id': f'SG{sgsg_ck % 100:02d}',
-                        'sgsg_name': f'{grgr_name} Standard',
-                        'cscs_id': f'CS{sgsg_ck % 100:02d}',
-                        'sgsg_state': attrs['grgr_state'],
-                        'sgsg_sts': 'AC',
-                        'sgsg_orig_eff_dt': orig_dt,
-                        'sgsg_term_dt': datetime(9999, 12, 31),
-                        'plans': sg_cfg['plans'],
-                        'plan_details': plan_details,
-                    },
-                })
+                    products = []
+                    for prod_cfg in plan_cfg.get('products', []):
+                        products.append({
+                            'lobd_id': prod_cfg.get('lobd_id', lobd_id),
+                            'member_clusters': prod_cfg.get('member_clusters', []),
+                        })
+                    if not products:
+                        products.append({
+                            'lobd_id': lobd_id,
+                            'member_clusters': [],
+                        })
 
-        return groups
+                    plan = {
+                        'type': cspd_cat,  # 'M', 'D', or 'C'
+                        'plan_detail': plan_detail,
+                        'member_clusters': plan_cfg.get('member_clusters', []),
+                        'products': products,
+                    }
+                    subgroup['plans'].append(plan)
 
-    # ── Enrollment ───────────────────────────────────────────────────
+                group['subgroups'].append(subgroup)
+
+            hierarchy.append(group)
+
+        return hierarchy
+
+    # -- Blending ------------------------------------------------------
+
+    def _pick_cluster(self, clusters):
+        """Pick a cluster from a list using weights. Returns (index, cluster_dict)."""
+        if not clusters:
+            # Return a neutral cluster if none defined
+            return 0, {
+                'name': 'default',
+                'weight': 1.0,
+                'continuous': {
+                    'age': {'mean': 40, 'std': 10},
+                    'tenure_months': {'mean': 60, 'std': 20},
+                },
+                'categorical': {
+                    'meme_sex': {'M': 0.50, 'F': 0.50},
+                    'meme_marital_status': {'M': 0.50, 'S': 0.50},
+                },
+            }
+        weights = np.array([c.get('weight', 1.0) for c in clusters], dtype=float)
+        weights /= weights.sum()
+        idx = self.rng.choice(len(clusters), p=weights)
+        return idx, clusters[idx]
+
+    def _blend_continuous(self, cluster_picks, attr_name, lo, hi):
+        """Weighted Gaussian sample across 4 levels for a continuous attribute."""
+        w = self.level_weights
+        total = 0.0
+        for level in ['group', 'subgroup', 'plan', 'product']:
+            cluster = cluster_picks[level]
+            params = cluster.get('continuous', {}).get(attr_name, {'mean': 40, 'std': 10})
+            sample = self.rng.normal(params['mean'], params['std'])
+            total += w[level] * sample
+        return float(np.clip(total, lo, hi))
+
+    def _blend_categorical(self, cluster_picks, attr_name):
+        """Weighted blend of categorical distributions, then sample once."""
+        w = self.level_weights
+        merged = {}
+        for level in ['group', 'subgroup', 'plan', 'product']:
+            cluster = cluster_picks[level]
+            dist = cluster.get('categorical', {}).get(attr_name, {})
+            for val, prob in dist.items():
+                merged[val] = merged.get(val, 0.0) + w[level] * prob
+        if not merged:
+            return 'M'  # fallback
+        values = list(merged.keys())
+        probs = np.array(list(merged.values()), dtype=float)
+        probs /= probs.sum()
+        return self.rng.choice(values, p=probs)
+
+    # -- Enrollment ----------------------------------------------------
 
     def _generate_enrollments(self, orig_eff_dt, enrollment_cfg):
         """Generate enrollment periods for a subscriber."""
@@ -282,12 +469,11 @@ class SyntheticGenerator:
             return periods
         return [(orig_eff_dt, open_end, '')]
 
-    # ── Row Building ─────────────────────────────────────────────────
+    # -- Row Building --------------------------------------------------
 
     def _make_member(self, *, meme_ck, sbsb_ck, sfx, rel, last_name, first_name,
                      mid_init, sex, birth_dt, ssn, eff_dt, marital,
-                     race, ethn, age, tenure, cluster_name, cluster_idx,
-                     group_cluster):
+                     race, ethn, age, tenure):
         return {
             'meme_ck': meme_ck, 'sbsb_ck': sbsb_ck, 'sfx': sfx, 'rel': rel,
             'last_name': last_name, 'first_name': first_name, 'mid_init': mid_init,
@@ -295,12 +481,9 @@ class SyntheticGenerator:
             'eff_dt': eff_dt, 'marital': marital,
             'race': race, 'ethn': ethn,
             'age': age, 'tenure': tenure,
-            'cluster_name': cluster_name, 'cluster_idx': cluster_idx,
-            'group_cluster': group_cluster,
         }
 
-    def _build_row(self, member, sbsb, group, sg, eff_dt, term_dt, trsn, plan_name):
-        pd_detail = sg['plan_details'][plan_name]
+    def _build_row(self, member, sbsb, group, sg, eff_dt, term_dt, trsn, pd_detail):
         fmt = lambda dt: dt.strftime('%Y-%m-%d')
         return [
             member['meme_ck'],                      # MEME_CK
@@ -357,11 +540,13 @@ class SyntheticGenerator:
             pd_detail['cspd_cat_desc'],             # CSPD_CAT_DESC
             pd_detail['cspd_type'],                 # CSPD_TYPE
             pd_detail['lobd_id'],                   # LOBD_ID
-            'N',                                    # PDPD_RISK_IND
-            'COMM',                                 # PDPD_MCTR_CCAT
+            pd_detail['pdpd_risk_ind'],             # PDPD_RISK_IND
+            pd_detail['pdpd_mctr_ccat'],            # PDPD_MCTR_CCAT
+            pd_detail['plds_desc'],                 # PLDS_DESC
+            pd_detail['pdds_desc'],                 # PDDS_DESC
         ]
 
-    # ── Sampling Helpers ─────────────────────────────────────────────
+    # -- Sampling Helpers ----------------------------------------------
 
     def _sample_gaussian_clipped(self, params, lo, hi):
         val = self.rng.normal(params['mean'], params['std'])
@@ -385,126 +570,179 @@ class SyntheticGenerator:
     def _next_sbsb_ck(self):
         v = self._sbsb_ck; self._sbsb_ck += 1; return v
 
-    def _next_grgr_ck(self):
-        v = self._grgr_ck; self._grgr_ck += 1; return v
-
-    def _next_sgsg_ck(self):
-        v = self._sgsg_ck; self._sgsg_ck += 1; return v
-
     def _next_ssn(self):
         v = self._ssn; self._ssn += 1; return f'{v:09d}'
 
 
-def generate_auto_config(seed=42, total_subscribers=500, n_member_clusters=5, n_group_clusters=3):
-    """Generate cluster config automatically with well-separated centroids.
+def generate_auto_config(seed=42, total_subscribers=500, n_groups=6,
+                         n_clusters_per_level=3):
+    """Generate cluster config automatically using real lookup tables.
 
-    Places member cluster centroids in age x tenure space with guaranteed
-    separation > 2*max(std) on at least one continuous dimension.
+    Samples real groups from the plans lookup and builds cluster definitions
+    with well-separated per-level centroids.
     """
     rng = np.random.default_rng(seed)
+    plans_lookup, subgroups_lookup = _load_lookups()
 
-    # Auto-place centroids in age(20-65) x tenure(1-200) space
-    age_range = np.linspace(23, 60, n_member_clusters)
-    tenure_range = np.linspace(4, 180, n_member_clusters)
-    # Shuffle tenure to avoid perfect correlation with age
-    tenure_order = list(range(n_member_clusters))
-    # Keep some correlation but not perfect
-    if n_member_clusters >= 3:
-        tenure_order[-1], tenure_order[-2] = tenure_order[-2], tenure_order[-1]
+    level_weights = {'group': 0.40, 'subgroup': 0.20, 'plan': 0.20, 'product': 0.20}
+    k = n_clusters_per_level
 
-    sex_ratios = [{'M': 0.5 + rng.uniform(-0.08, 0.08),
-                   'F': 0.5 + rng.uniform(-0.08, 0.08)}
-                  for _ in range(n_member_clusters)]
+    def _make_clusters(k, age_lo, age_hi, tenure_lo, tenure_hi, prefix,
+                       include_family=False):
+        """Generate k well-separated clusters in a given age/tenure range."""
+        age_centers = np.linspace(age_lo, age_hi, k)
+        tenure_centers = np.linspace(tenure_lo, tenure_hi, k)
+        if k >= 3:
+            tenure_order = list(range(k))
+            tenure_order[-1], tenure_order[-2] = tenure_order[-2], tenure_order[-1]
+        else:
+            tenure_order = list(range(k))
 
-    marital_options = [
-        {'S': 0.85, 'M': 0.15},
-        {'M': 0.85, 'S': 0.15},
-        {'M': 0.70, 'S': 0.15, 'D': 0.15},
-        {'M': 0.60, 'S': 0.15, 'W': 0.10, 'D': 0.15},
-        {'S': 0.95, 'M': 0.05},
-    ]
+        clusters = []
+        sex_base = [
+            {'M': 0.72, 'F': 0.28},
+            {'M': 0.38, 'F': 0.62},
+            {'M': 0.50, 'F': 0.50},
+        ]
+        marital_base = [
+            {'S': 0.85, 'M': 0.15},
+            {'M': 0.80, 'S': 0.10, 'D': 0.10},
+            {'M': 0.50, 'S': 0.25, 'D': 0.15, 'W': 0.10},
+        ]
+        family_configs = [
+            {'spouse_prob': 0.08, 'children': {'mean': 0.1, 'std': 0.3}},
+            {'spouse_prob': 0.75, 'children': {'mean': 2.0, 'std': 0.8}},
+            {'spouse_prob': 0.45, 'children': {'mean': 0.7, 'std': 0.6}},
+        ]
 
-    family_configs = [
-        {'spouse_prob': 0.10, 'children': {'mean': 0.1, 'std': 0.3}},
-        {'spouse_prob': 0.85, 'children': {'mean': 2.0, 'std': 0.8}},
-        {'spouse_prob': 0.55, 'children': {'mean': 1.0, 'std': 0.8}},
-        {'spouse_prob': 0.45, 'children': {'mean': 0.2, 'std': 0.4}},
-        {'spouse_prob': 0.03, 'children': {'mean': 0, 'std': 0}},
-    ]
+        for i in range(k):
+            age_std = rng.uniform(1.0, 2.0)
+            tenure_std = rng.uniform(1.5, 3.0)
+            c = {
+                'name': f'{prefix}_{i}',
+                'weight': round(1.0 / k, 4),
+                'continuous': {
+                    'age': {'mean': float(np.clip(age_centers[i], 19, 68)),
+                            'std': float(age_std)},
+                    'tenure_months': {
+                        'mean': float(np.clip(tenure_centers[tenure_order[i]], 2, 350)),
+                        'std': float(tenure_std)},
+                },
+                'categorical': {
+                    'meme_sex': sex_base[i % len(sex_base)],
+                    'meme_marital_status': marital_base[i % len(marital_base)],
+                },
+            }
+            if include_family:
+                c['family'] = family_configs[i % len(family_configs)]
+            clusters.append(c)
 
-    plan_prefs = ['medical_only', 'full_suite', 'medical_dental',
-                  'medical_dental', 'medical_only']
+        return clusters
 
-    member_clusters = []
-    for i in range(n_member_clusters):
-        age_std = rng.uniform(1.5, 4.0)
-        tenure_std = rng.uniform(2, max(3, tenure_range[tenure_order[i]] * 0.15))
-        member_clusters.append({
-            'name': f'cluster_{i}',
-            'continuous': {
-                'age': {'mean': float(age_range[i]), 'std': float(age_std)},
-                'tenure_months': {'mean': float(tenure_range[tenure_order[i]]),
-                                  'std': float(tenure_std)},
-            },
-            'categorical': {
-                'meme_sex': sex_ratios[i % len(sex_ratios)],
-                'meme_marital_status': marital_options[i % len(marital_options)],
-            },
-            'family': family_configs[i % len(family_configs)],
-            'plan_preference': plan_prefs[i % len(plan_prefs)],
-        })
+    # -- Build SHARED cluster sets for subgroup/plan/product levels --
+    shared_subgroup_clusters = _make_clusters(k, 22, 58, 5, 210, 'sg')
+    shared_plan_clusters = {
+        'M': _make_clusters(k, 28, 52, 20, 120, 'med'),
+        'D': _make_clusters(k, 28, 52, 20, 120, 'den'),
+        'C': _make_clusters(k, 28, 52, 20, 120, 'cm'),
+    }
 
-    # Auto group clusters
-    states = ['OH', 'IN', 'KY']
-    counties = [['Franklin', 'Cuyahoga', 'Hamilton'],
-                ['Marion', 'Allen', 'Lake'],
-                ['Jefferson', 'Fayette', 'Kenton']]
-    plan_sets = [['medical', 'dental', 'vision'], ['medical', 'dental'], ['medical']]
+    # Collect unique LOBD_IDs from lookup
+    all_lobd_ids = plans_lookup['LOBD_ID'].dropna().unique()
+    shared_product_clusters = {}
+    for lobd_id in all_lobd_ids:
+        shared_product_clusters[lobd_id] = _make_clusters(
+            k, 35, 45, 50, 90, lobd_id[:6])
 
-    group_clusters = []
-    for j in range(n_group_clusters):
-        mc_weights = {}
-        base = rng.dirichlet(np.ones(n_member_clusters))
-        for i, mc in enumerate(member_clusters):
-            mc_weights[mc['name']] = float(base[i])
+    # -- Sample real groups from lookup --
+    available_groups = sorted(plans_lookup['GRGR_CK'].unique())
+    selected_grgr_cks = list(rng.choice(
+        available_groups, size=min(n_groups, len(available_groups)), replace=False))
 
-        group_clusters.append({
-            'name': f'group_type_{j}',
-            'weight': 1.0 / n_group_clusters,
-            'count': max(2, int(round(rng.normal(3, 1)))),
-            'attributes': {
-                'subscriber_count': {'mean': int(rng.uniform(30, 120)),
-                                     'std': int(rng.uniform(5, 20))},
-                'grgr_state': states[j % len(states)],
-                'grgr_county': rng.choice(counties[j % len(counties)]),
-                'grgr_mctr_type': 'COMM',
-                'grgr_orig_year': {'mean': int(rng.uniform(2014, 2022)), 'std': 2},
-            },
-            'name_templates': ['{prefix} Corp', '{prefix} Inc', '{prefix} LLC',
-                               '{prefix} Group'],
-            'subgroup': {'plans': plan_sets[j % len(plan_sets)]},
-            'member_cluster_weights': mc_weights,
+    groups = []
+    for g_i, grgr_ck in enumerate(selected_grgr_cks):
+        grgr_ck = int(grgr_ck)
+        grp_plans = plans_lookup[plans_lookup['GRGR_CK'] == grgr_ck]
+        grp_ref = grp_plans.iloc[0]
+        target_subs = int(rng.integers(40, 130))
+
+        # Per-group clusters with shifted centroids
+        age_shift = rng.uniform(-8, 8)
+        tenure_shift = rng.uniform(-25, 25)
+        group_clusters = _make_clusters(
+            k, 22 + age_shift, 60 + age_shift,
+            5 + tenure_shift, 180 + tenure_shift,
+            f'g{g_i}', include_family=True)
+
+        # Get real subgroups for this group
+        grp_sgs = subgroups_lookup[
+            (subgroups_lookup['GRGR_CK'] == grgr_ck) &
+            (subgroups_lookup['SGSG_STS'] == 'AC')
+        ]
+        if len(grp_sgs) == 0:
+            grp_sgs = subgroups_lookup[subgroups_lookup['GRGR_CK'] == grgr_ck]
+        n_subgroups = min(2, len(grp_sgs))
+        if n_subgroups == 0:
+            continue
+        selected_sgs = grp_sgs.head(n_subgroups)
+
+        # Get real CSPI_IDs per CSPD_CAT (pick 1-2 per category)
+        cat_plans = {}
+        for cat in sorted(grp_plans['CSPD_CAT'].unique()):
+            cat_rows = grp_plans[grp_plans['CSPD_CAT'] == cat].drop_duplicates(
+                subset=['CSPI_ID'])
+            # Prefer active plans
+            active = cat_rows[cat_rows['CSPI_TERM_DT'].astype(str).str.contains('9999')]
+            if len(active) > 0:
+                cat_rows = active
+            cat_plans[cat] = list(cat_rows['CSPI_ID'].head(2))
+
+        subgroups = []
+        for _, sg_row in selected_sgs.iterrows():
+            sg_plans = []
+            for cat, cspi_ids in cat_plans.items():
+                for cspi_id in cspi_ids:
+                    pl_row = grp_plans[grp_plans['CSPI_ID'] == cspi_id].iloc[0]
+                    lobd_id = _safe_str(pl_row['LOBD_ID'])
+                    prod_clusters = shared_product_clusters.get(
+                        lobd_id, _make_clusters(k, 35, 45, 50, 90, 'dflt'))
+                    sg_plans.append({
+                        'cspi_id': cspi_id,
+                        'member_clusters': shared_plan_clusters.get(
+                            cat, shared_plan_clusters['M']),
+                        'products': [{
+                            'lobd_id': lobd_id,
+                            'member_clusters': prod_clusters,
+                        }],
+                    })
+
+            subgroups.append({
+                'sgsg_ck': int(sg_row['SGSG_CK']),
+                'member_clusters': shared_subgroup_clusters,
+                'plans': sg_plans,
+            })
+
+        groups.append({
+            'grgr_ck': grgr_ck,
+            'target_subscribers': target_subs,
+            'member_clusters': group_clusters,
+            'subgroups': subgroups,
         })
 
     return {
         'seed': seed,
         'reference_date': '2025-01-01',
         'total_subscribers': total_subscribers,
-        'group_clusters': group_clusters,
-        'member_clusters': member_clusters,
-        'plan_profiles': {
-            'medical_only': ['medical'],
-            'medical_dental': ['medical', 'dental'],
-            'full_suite': ['medical', 'dental', 'vision'],
-        },
+        'level_weights': level_weights,
+        'groups': groups,
         'enrollment': {
             'term_rate': 0.10,
             'reinstate_rate': 0.40,
             'term_reasons': ['VTRM', 'NPAY', 'MOVE'],
         },
-        'group_name_prefixes': [
-            'Buckeye', 'Great Lakes', 'Midwest', 'Heritage', 'Summit',
-            'Cascade', 'Pinnacle', 'Horizon', 'Keystone', 'Frontier',
-            'Liberty', 'Pioneer', 'Crestview', 'Sterling', 'Apex',
-        ],
+        'plan_enrollment_weights': {
+            'M': 1.0,
+            'D': 0.60,
+            'C': 0.30,
+        },
     }
