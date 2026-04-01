@@ -39,13 +39,28 @@ def cached_discover(data_hash: str, df, labels_df, top_n=50):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 st.title("Pattern Discovery")
-st.markdown(
-    "Discover the **top 50 patterns** across all valid hierarchy "
+st.caption(
+    "Discover the top 50 patterns across all valid hierarchy "
     "combinations (Group, Subgroup, Plan Category, Line of Business) at every depth, "
     "ranked by member count."
 )
 
 df, labels_df = cached_load_data()
+
+# ── Dataset overview metrics ──────────────────────────────────────────────────
+
+n_members = df["MEME_CK"].nunique()
+n_groups = df["GRGR_CK"].nunique()
+n_subgroups = df["SGSG_CK"].nunique()
+n_lobs = df["LOBD_ID"].nunique()
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Total Members", f"{n_members:,}")
+m2.metric("Groups", n_groups)
+m3.metric("Subgroups", n_subgroups)
+m4.metric("Lines of Business", n_lobs)
+
+st.markdown("")  # spacer
 
 if st.button("Compute Top Patterns", type="primary"):
     st.session_state["run_discovery"] = True
@@ -73,54 +88,62 @@ if "navigate_to_pattern" in st.session_state:
     st.session_state["auto_run"] = True
     st.switch_page("pages/1_profiler.py")
 
-# ── Build display table ───────────────────────────────────────────────────────
+# ── Discovery summary metrics ────────────────────────────────────────────────
 
-st.subheader(f"Top {len(patterns)} Patterns by Member Count")
+largest = patterns[0]["size"]
+smallest = patterns[-1]["size"]
+n_unique_combos = len({
+    (tuple(p["combo"].get("grgr_ck") or []),
+     tuple(p["combo"].get("sgsg_ck") or []),
+     tuple(p["combo"].get("cspd_cat") or []),
+     tuple(p["combo"].get("lobd_id") or []))
+    for p in patterns
+})
 
-# Build a dataframe for display
+st.divider()
+
+s1, s2, s3, s4 = st.columns(4)
+s1.metric("Patterns Found", len(patterns))
+s2.metric("Largest Pattern", f"{largest:,}")
+s3.metric("Smallest (in Top 50)", f"{smallest:,}")
+s4.metric("Unique Combos", n_unique_combos)
+
+# ── Results table ─────────────────────────────────────────────────────────────
+
+st.subheader("Top Patterns by Member Count")
+st.caption("Click a row to view it in the Pattern Profiler.")
+
+total_population = df["MEME_CK"].nunique()
+
 table_data = []
 for rank, pattern in enumerate(patterns, 1):
     table_data.append({
-        "Rank": rank,
+        "Rank": str(rank),
         "Group": pattern["grgr_name"],
         "Subgroup": pattern["sgsg_name"],
         "Plan Category": pattern["cspd_cat_desc"],
         "Line of Business": pattern["plds_desc"],
-        "Pattern #": pattern["cluster_id"],
-        "Members": pattern["size"],
-        "Patterns in Combo": pattern["n_patterns"],
+        "Pattern": str(pattern["cluster_id"]),
+        "Members": f"{pattern['size']:,}",
+        "% of Pop": f"{pattern['size'] / total_population * 100:.2f}%",
     })
 
 display_df = pd.DataFrame(table_data)
-st.dataframe(
+event = st.dataframe(
     display_df,
     width="stretch",
     hide_index=True,
-    column_config={
-        "Rank": st.column_config.NumberColumn("Rank", width="small"),
-        "Group": st.column_config.TextColumn("Group", width="medium"),
-        "Subgroup": st.column_config.TextColumn("Subgroup", width="medium"),
-        "Plan Category": st.column_config.TextColumn("Plan Category", width="medium"),
-        "Line of Business": st.column_config.TextColumn("Line of Business", width="medium"),
-        "Pattern #": st.column_config.NumberColumn("Pattern #", width="small"),
-        "Members": st.column_config.NumberColumn("Members", format="%d", width="small"),
-        "Patterns in Combo": st.column_config.NumberColumn("Patterns in Combo", width="small"),
-    },
+    height=500,
+    on_select="rerun",
+    selection_mode="single-row",
 )
 
-st.markdown("---")
-st.subheader("View a Pattern")
-
-pattern_choice = st.selectbox(
-    "Select a pattern to view in the profiler",
-    options=range(len(patterns)),
-    format_func=lambda i: (
-        f"#{i+1} — {patterns[i]['grgr_name']} / {patterns[i]['sgsg_name']} / "
-        f"{patterns[i]['cspd_cat_desc']} / {patterns[i]['plds_desc']} — "
-        f"Pattern {patterns[i]['cluster_id']} ({patterns[i]['size']:,} members)"
-    ),
-)
-
-if st.button("View in Profiler", type="primary"):
-    st.session_state["navigate_to_pattern"] = patterns[pattern_choice]["combo"]
+# Handle row click → navigate to profiler
+selected_rows = event.selection.rows
+if selected_rows:
+    idx = selected_rows[0]
+    selected = patterns[idx]
+    st.session_state["navigate_to_pattern"] = selected["combo"]
+    st.session_state["preselect_k"] = selected["n_patterns"]
+    st.session_state["preselect_cluster_id"] = selected["cluster_id"]
     st.rerun()

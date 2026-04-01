@@ -1,6 +1,7 @@
 """Streamlit UI for the Pattern Profiler."""
 
 import json
+from pathlib import Path
 
 import anthropic
 import numpy as np
@@ -23,6 +24,7 @@ from cluster_profiler.clustering import build_features, discover_clusters
 from cluster_profiler.data_loader import apply_filters, load_data
 from cluster_profiler.formatters import format_json
 from cluster_profiler.profiler import build_subset_summary, profile_all_clusters
+from cluster_profiler.synthetic import generate_synthetic_subscribers
 
 
 @st.cache_data
@@ -47,14 +49,12 @@ def build_inclusion_rules(profile: dict) -> list[str]:
     """Derive human-readable inclusion rules from a pattern profile."""
     rules = []
 
-    # Continuous feature rules: mean ± 1 std range
     for col_name, stats in profile.get("continuous", {}).items():
         label = "Age" if col_name == "_age" else "Tenure (months)"
         lo = max(0, stats["mean"] - stats["std"])
         hi = stats["mean"] + stats["std"]
-        rules.append(f"{lo:.0f} ≤ {label} ≤ {hi:.0f}")
+        rules.append(f"{lo:.0f} \u2264 {label} \u2264 {hi:.0f}")
 
-    # Categorical rules: majority category (>50%) or top two if none dominant
     for col_name, cat_data in profile.get("categorical", {}).items():
         pct = cat_data.get("pct", {})
         if not pct:
@@ -68,7 +68,6 @@ def build_inclusion_rules(profile: dict) -> list[str]:
             parts = " or ".join(f"{v} ({p * 100:.0f}%)" for v, p in top_two)
             rules.append(f"{col_name} IN [{parts}]")
 
-    # Family rules
     family = profile.get("family", {})
     if family:
         if family.get("spouse_rate", 0) > 0.50:
@@ -77,7 +76,7 @@ def build_inclusion_rules(profile: dict) -> list[str]:
             rules.append(f"Spouse unlikely ({family['spouse_rate'] * 100:.0f}%)")
         avg_dep = family.get("avg_dependents", 0)
         if avg_dep >= 1.0:
-            rules.append(f"Avg dependents ≥ {avg_dep:.1f}")
+            rules.append(f"Avg dependents \u2265 {avg_dep:.1f}")
         elif avg_dep < 0.3:
             rules.append(f"Few/no dependents (avg {avg_dep:.1f})")
 
@@ -95,7 +94,6 @@ def build_save_rule(
     """Build a composite AND-joined rule combining hierarchy filters and demographic rules."""
     clauses = []
 
-    # Hierarchy conditions from sidebar selections
     if filters_used.get("grgr_ck"):
         keys = ", ".join(str(k) for k in filters_used["grgr_ck"])
         clauses.append(f"GRGR_CK IN ({keys})")
@@ -109,7 +107,6 @@ def build_save_rule(
         keys = ", ".join(f"'{k}'" for k in filters_used["lobd_id"])
         clauses.append(f"LOBD_ID IN ({keys})")
 
-    # Demographic / categorical inclusion rules
     clauses.extend(build_inclusion_rules(profile))
 
     return " AND\n".join(clauses)
@@ -147,25 +144,25 @@ preselect_grgr = st.session_state.pop("preselect_grgr_ck", None)
 preselect_sgsg = st.session_state.pop("preselect_sgsg_ck", None)
 preselect_cspd = st.session_state.pop("preselect_cspd_cat", None)
 preselect_lobd = st.session_state.pop("preselect_lobd_id", None)
+preselect_k = st.session_state.pop("preselect_k", None)
+preselect_cluster_id = st.session_state.pop("preselect_cluster_id", None)
 auto_run = st.session_state.pop("auto_run", False)
 
 # ── Sidebar: Cascading Filters ────────────────────────────────────────────────
 
 st.sidebar.header("Hierarchy Filters")
 
-if st.sidebar.button("Back to Overview"):
-    st.switch_page("pages/top_50.py")
 
-# Helper: build options list from pairs dataframe
 def _build_options(pairs_df, key_col, name_col):
     return [format_option(row[key_col], row[name_col]) for _, row in pairs_df.iterrows()]
 
-# Helper: find option strings matching preselected keys
+
 def _match_preselect(options, preselect_values, cast=str):
     if preselect_values is None:
         return []
     preselect_set = {cast(v) for v in preselect_values}
     return [opt for opt in options if cast(parse_option_key(opt)) in preselect_set]
+
 
 # 1. Group
 group_pairs = (
@@ -175,14 +172,13 @@ group_pairs = (
 )
 group_options = _build_options(group_pairs, "GRGR_CK", "GRGR_NAME")
 
-# Pre-set widget state before rendering so Streamlit uses it
 if preselect_grgr is not None and "wk_group" not in st.session_state:
     st.session_state["wk_group"] = _match_preselect(group_options, preselect_grgr, cast=int)
 
 selected_group_labels = st.sidebar.multiselect("Group", group_options, key="wk_group")
 selected_grgr_cks = [int(parse_option_key(g)) for g in selected_group_labels]
 
-# 2. Subgroup — filtered by selected groups
+# 2. Subgroup
 filtered = df[df["GRGR_CK"].isin(selected_grgr_cks)] if selected_grgr_cks else df
 subgroup_pairs = (
     filtered[["SGSG_CK", "SGSG_NAME"]]
@@ -197,7 +193,7 @@ if preselect_sgsg is not None and "wk_subgroup" not in st.session_state:
 selected_subgroup_labels = st.sidebar.multiselect("Subgroup", subgroup_options, key="wk_subgroup")
 selected_sgsg_cks = [int(parse_option_key(s)) for s in selected_subgroup_labels]
 
-# 3. Plan Category — filtered by group + subgroup
+# 3. Plan Category
 if selected_sgsg_cks:
     filtered = filtered[filtered["SGSG_CK"].isin(selected_sgsg_cks)]
 cat_pairs = (
@@ -213,7 +209,7 @@ if preselect_cspd is not None and "wk_cat" not in st.session_state:
 selected_cat_labels = st.sidebar.multiselect("Plan Category", cat_options, key="wk_cat")
 selected_cspd_cats = [parse_option_key(c) for c in selected_cat_labels]
 
-# 4. Line of Business — filtered by group + subgroup + plan category
+# 4. Line of Business
 if selected_cspd_cats:
     filtered = filtered[filtered["CSPD_CAT"].isin(selected_cspd_cats)]
 lob_pairs = (
@@ -230,12 +226,19 @@ selected_lob_labels = st.sidebar.multiselect("Line of Business", lob_options, ke
 selected_lobd_ids = [parse_option_key(l) for l in selected_lob_labels]
 
 # Pattern detection options
-st.sidebar.markdown("---")
-st.sidebar.header("Pattern Detection Options")
+st.sidebar.divider()
+st.sidebar.header("Pattern Detection")
+k_default = preselect_k if preselect_k is not None else 0
 k_override = st.sidebar.number_input(
-    "K override (0 = auto)", min_value=0, max_value=20, value=0, step=1
+    "K override (0 = auto)", min_value=0, max_value=20, value=k_default, step=1
 )
-run = st.sidebar.button("Run Profiler", type="primary") or auto_run
+if k_override == 1:
+    st.sidebar.warning("K must be 0 (auto) or at least 2.")
+    k_override = 0
+if st.sidebar.button("Run Profiler", type="primary", use_container_width=True) or auto_run:
+    st.session_state["profiler_run"] = True
+
+run = st.session_state.get("profiler_run", False)
 
 # ── Main Area ─────────────────────────────────────────────────────────────────
 
@@ -273,12 +276,18 @@ profiles = profile_all_clusters(subset_members, family_data, assignments)
 
 pct_of_total = summary["total_members"] / len(df) * 100
 col1, col2, col3 = st.columns(3)
-col1.metric("Percent of Members", f"{pct_of_total:.1f}%")
-col2.metric("Patterns", metrics["n_clusters"])
-col3.metric("Member Count", summary["total_members"])
-
+col1.metric("Subset of Total", f"{pct_of_total:.1f}%")
+col2.metric("Patterns Found", metrics["n_clusters"])
+col3.metric("Members in Subset", f"{summary['total_members']:,}")
 
 # ── Per-Pattern Profiles ──────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("Pattern Details")
+
+# Reorder profiles so the pre-selected pattern appears first
+if preselect_cluster_id is not None:
+    profiles = sorted(profiles, key=lambda p: p["cluster_id"] != preselect_cluster_id)
 
 if len(profiles) <= 8:
     tab_labels = [f"Pattern {p['cluster_id']}" for p in profiles]
@@ -286,19 +295,18 @@ if len(profiles) <= 8:
     containers = tabs
 else:
     containers = [
-        st.expander(f"Pattern {p['cluster_id']}", expanded=False)
+        st.expander(
+            f"Pattern {p['cluster_id']}",
+            expanded=(p["cluster_id"] == preselect_cluster_id),
+        )
         for p in profiles
     ]
 
 for container, profile in zip(containers, profiles):
     with container:
-        # Size info
-        st.markdown(
-            f"**Size:** {profile['size']} members "
-            f"({profile['pct_of_subset'] * 100:.1f}% of subset)"
-        )
+        # ── Summary row: size + AI summary side by side ───────────────
+        size_pct = profile['pct_of_subset'] * 100
 
-        # LLM summary
         try:
             profile_for_llm = {
                 k: profile[k] for k in
@@ -311,101 +319,159 @@ for container, profile in zip(containers, profiles):
                 profile["cluster_id"],
                 summary["total_members"],
             )
-            st.subheader("Pattern Summary")
-            st.info(llm_summary)
-        except Exception as exc:
-            st.warning(f"Could not generate AI summary: {exc}")
+        except Exception:
+            llm_summary = None
 
-        # Demographics table
-        if profile["continuous"]:
-            demo_rows = []
-            for col_name, stats in profile["continuous"].items():
-                label = "Age (years)" if col_name == "_age" else "Tenure (months)"
-                demo_rows.append({
-                    "Feature": label,
-                    "Mean": f"{stats['mean']:.1f}",
-                    "Std": f"{stats['std']:.1f}",
-                    "Median": f"{stats['median']:.1f}",
-                    "Min": f"{stats['min']:.1f}",
-                    "Max": f"{stats['max']:.1f}",
-                })
-            st.subheader("Demographics")
-            st.dataframe(pd.DataFrame(demo_rows), width="stretch", hide_index=True)
-
-        # Categorical distributions — horizontal bar charts
-        if profile["categorical"]:
-            for col_name, cat_data in profile["categorical"].items():
-                pct = cat_data["pct"]
-                if pct:
-                    fig = px.bar(
-                        x=list(pct.values()),
-                        y=list(pct.keys()),
-                        orientation="h",
-                        labels={"x": "Percentage (%)", "y": col_name},
-                        title=col_name,
-                    )
-                    fig.update_layout(
-                        height=max(200, len(pct) * 40),
-                        margin=dict(l=0, r=0, t=30, b=0),
-                        showlegend=False,
-                    )
-                    st.plotly_chart(fig, width="stretch",
-                                     key=f"cat_{profile['cluster_id']}_{col_name}")
-
-        # Family stats
+        # Size metrics row
+        pm1, pm2, pm3, pm4 = st.columns(4)
+        pm1.metric("Members", f"{profile['size']:,}")
+        pm2.metric("% of Subset", f"{size_pct:.1f}%")
         if profile.get("family"):
-            st.subheader("Family Statistics")
-            fc1, fc2 = st.columns(2)
-            fc1.metric("Avg Dependents", f"{profile['family']['avg_dependents']:.2f}")
-            fc2.metric("Spouse Rate", f"{profile['family']['spouse_rate']:.1%}")
+            pm3.metric("Avg Dependents", f"{profile['family']['avg_dependents']:.2f}")
+            pm4.metric("Spouse Rate", f"{profile['family']['spouse_rate']:.1%}")
 
-        # Composite pattern rule
+        if llm_summary:
+            st.subheader("Summary")
+            st.info(llm_summary)
+
+        # ── Demographics + Categorical side by side ───────────────────
+        left_col, right_col = st.columns(2)
+
+        with left_col:
+            if profile["continuous"]:
+                st.markdown("**Demographics**")
+                demo_rows = []
+                for col_name, stats in profile["continuous"].items():
+                    label = "Age (years)" if col_name == "_age" else "Tenure (months)"
+                    demo_rows.append({
+                        "Feature": label,
+                        "Mean": f"{stats['mean']:.1f}",
+                        "Std": f"{stats['std']:.1f}",
+                        "Median": f"{stats['median']:.1f}",
+                        "Min": f"{stats['min']:.1f}",
+                        "Max": f"{stats['max']:.1f}",
+                    })
+                st.dataframe(
+                    pd.DataFrame(demo_rows),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        with right_col:
+            if profile["categorical"]:
+                st.markdown("**Categorical Distributions**")
+                for col_name, cat_data in profile["categorical"].items():
+                    pct = cat_data["pct"]
+                    if pct:
+                        fig = px.bar(
+                            x=list(pct.values()),
+                            y=list(pct.keys()),
+                            orientation="h",
+                            labels={"x": "Proportion", "y": ""},
+                            title=col_name,
+                        )
+                        fig.update_layout(
+                            height=max(150, len(pct) * 45),
+                            margin=dict(l=0, r=0, t=30, b=0),
+                            showlegend=False,
+                            xaxis_tickformat=".0%",
+                        )
+                        st.plotly_chart(
+                            fig, width="stretch",
+                            key=f"cat_{profile['cluster_id']}_{col_name}",
+                        )
+
+        # ── Pattern rule + downloads ──────────────────────────────────
         save_rule = build_save_rule(
             profile, filters_used,
             selected_group_labels, selected_subgroup_labels,
             selected_cat_labels, selected_lob_labels,
         )
-        if save_rule:
-            st.subheader("Pattern Rule")
-            st.code(save_rule, language=None)
-            rule_file_content = (
-                f"Pattern {profile['cluster_id']} Rule\n"
-                f"Members: {profile['size']}\n"
-                f"{'=' * 40}\n\n"
-                f"{save_rule}\n"
+
+        with st.expander("Pattern Rule"):
+            if save_rule:
+                st.code(save_rule, language=None)
+
+                rule_name = st.text_input(
+                    "Rule name",
+                    value=f"Pattern {profile['cluster_id']}",
+                    key=f"rule_name_{profile['cluster_id']}",
+                )
+
+                btn_col1, btn_col2 = st.columns(2)
+                save_clicked = btn_col1.button("Save Rule", key=f"save_rule_{profile['cluster_id']}")
+                view_rules_clicked = btn_col2.button("View Saved Rules", key=f"view_rules_{profile['cluster_id']}")
+
+                if save_clicked:
+                    rules_path = Path("data/pattern_rules.csv")
+                    rules_path.parent.mkdir(parents=True, exist_ok=True)
+                    new_row = pd.DataFrame([{
+                        "name": rule_name,
+                        "pattern_id": profile["cluster_id"],
+                        "members": profile["size"],
+                        "rule": save_rule,
+                    }])
+                    if rules_path.exists():
+                        existing = pd.read_csv(rules_path)
+                        combined = pd.concat([existing, new_row], ignore_index=True)
+                    else:
+                        combined = new_row
+                    combined.to_csv(rules_path, index=False)
+                    st.success(f"Rule '{rule_name}' saved to {rules_path}")
+
+                if view_rules_clicked:
+                    rules_path = Path("data/pattern_rules.csv")
+                    if rules_path.exists():
+                        rules_df = pd.read_csv(rules_path).astype(str)
+                        st.dataframe(rules_df, width="stretch", hide_index=True)
+                    else:
+                        st.info("No saved rules yet.")
+
+        with st.expander("Data"):
+            cid = profile["cluster_id"]
+            mask = np.array(assignments) == cid
+            raw_df = subset_members.iloc[mask]
+
+            st.markdown("**Generate Synthetic Data**")
+            n_subs = st.number_input(
+                "Number of subscribers",
+                min_value=1, max_value=100000, value=100, step=100,
+                key=f"n_subs_{cid}",
             )
-            st.download_button(
-                label="Save Rule",
-                data=rule_file_content,
-                file_name=f"pattern_{profile['cluster_id']}_rule.txt",
-                mime="text/plain",
-                key=f"save_rule_{profile['cluster_id']}",
-            )
+            gen_col, raw_col = st.columns(2)
+            gen_clicked = gen_col.button("Generate", key=f"gen_{cid}")
+            raw_clicked = raw_col.button(f"View Raw Data ({len(raw_df)})", key=f"raw_{cid}")
 
-        # Raw data viewer
-        cid = profile["cluster_id"]
-        mask = np.array(assignments) == cid
-        raw_df = subset_members.iloc[mask]
-        with st.expander(f"View Raw Data ({len(raw_df)} rows)"):
-            st.dataframe(raw_df, width="stretch", height=400)
+            if gen_clicked:
+                synthetic_df = generate_synthetic_subscribers(
+                    profile, filters_used, n_subs, DEFAULT_REFERENCE_DATE,
+                )
+                safe_name = rule_name.replace(" ", "_").replace("/", "_")
+                output_path = Path(f"data/synthetic_{safe_name}.csv")
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                synthetic_df.to_csv(output_path, index=False)
+                st.success(f"Generated {len(synthetic_df)} rows ({n_subs} subscribers) → {output_path}")
+                st.dataframe(synthetic_df.head(20), width="stretch", hide_index=True)
 
-# ── Visualizations (Plotly) ───────────────────────────────────────────────────
+            if raw_clicked:
+                st.dataframe(raw_df, width="stretch", height=400)
 
-st.header("Pattern Visualizations")
+# ── Visualizations ────────────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("Pattern Visualizations")
 
 X, _scaler = build_features(subset_members)
 unique_clusters = sorted(set(assignments))
-n_clusters = len(unique_clusters)
-cluster_labels = [f"Pattern {c}" for c in assignments]
+colors = px.colors.qualitative.T10
 
 fig = make_subplots(
     rows=1, cols=3,
     subplot_titles=("PCA Scatter", "Age Distribution", "Tenure Distribution"),
+    horizontal_spacing=0.08,
 )
 
-colors = px.colors.qualitative.T10
-
-# 1. PCA scatter
+# PCA scatter
 if X.shape[1] >= 2:
     pca = PCA(n_components=2)
     coords = pca.fit_transform(X)
@@ -430,14 +496,14 @@ if X.shape[1] >= 2:
         row=1, col=1,
     )
 
-# 2. Age histogram
+# Age histogram
 for i, cid in enumerate(unique_clusters):
     mask = np.array(assignments) == cid
     vals = subset_members.iloc[mask]["_age"].dropna()
     if len(vals) > 0:
         fig.add_trace(
             go.Histogram(
-                x=vals, nbinsx=20, opacity=0.5,
+                x=vals, nbinsx=20,
                 marker_color=colors[i % len(colors)],
                 name=f"Pattern {cid}",
                 legendgroup=f"c{cid}",
@@ -447,16 +513,15 @@ for i, cid in enumerate(unique_clusters):
         )
 fig.update_xaxes(title_text="Age (years)", row=1, col=2)
 fig.update_yaxes(title_text="Count", row=1, col=2)
-fig.update_layout(barmode="overlay")
 
-# 3. Tenure histogram
+# Tenure histogram
 for i, cid in enumerate(unique_clusters):
     mask = np.array(assignments) == cid
     vals = subset_members.iloc[mask]["_tenure"].dropna()
     if len(vals) > 0:
         fig.add_trace(
             go.Histogram(
-                x=vals, nbinsx=20, opacity=0.5,
+                x=vals, nbinsx=20,
                 marker_color=colors[i % len(colors)],
                 name=f"Pattern {cid}",
                 legendgroup=f"c{cid}",
@@ -467,14 +532,21 @@ for i, cid in enumerate(unique_clusters):
 fig.update_xaxes(title_text="Tenure (months)", row=1, col=3)
 fig.update_yaxes(title_text="Count", row=1, col=3)
 
-fig.update_layout(height=450, title_text="Pattern Profiles")
+fig.update_layout(
+    barmode="stack",
+    height=400,
+    margin=dict(l=40, r=40, t=40, b=40),
+    legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
+)
 st.plotly_chart(fig, width="stretch", key="main_viz")
 
 # ── JSON Download ─────────────────────────────────────────────────────────────
 
+st.divider()
+
 json_output = format_json(summary, profiles, metrics)
 st.download_button(
-    label="Download JSON Report",
+    label="Download Full JSON Report",
     data=json.dumps(json_output, indent=2, default=str),
     file_name="pattern_profile.json",
     mime="application/json",

@@ -13,9 +13,12 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import streamlit as st
 
-st.set_page_config(page_title="Pattern Discovery", layout="wide")
+from cluster_profiler.styles import inject_css
 
-landing = st.Page("pages/top_50.py", title="Top 50 Patterns", default=True)
+st.set_page_config(page_title="Pattern Discovery", layout="wide")
+inject_css()
+
+landing = st.Page("pages/top_50.py", title="Pattern Discovery", default=True)
 profiler = st.Page("pages/1_profiler.py", title="Pattern Profiler")
 
 nav = st.navigation([landing, profiler])
