@@ -42,7 +42,7 @@ st.title("Pattern Discovery")
 st.caption(
     "Discover the top 50 patterns across all valid hierarchy "
     "combinations (Group, Subgroup, Plan Category, Line of Business) at every depth, "
-    "ranked by member count."
+    "ranked by member count or silhouette score."
 )
 
 df, labels_df = cached_load_data()
@@ -62,16 +62,27 @@ m4.metric("Lines of Business", n_lobs)
 
 st.markdown("")  # spacer
 
+rank_by = st.radio(
+    "Rank patterns by",
+    ["Member Count", "Silhouette Score"],
+    horizontal=True,
+)
+
+top_n = st.number_input(
+    "Number of top patterns to return",
+    min_value=1, max_value=500, value=50, step=10,
+)
+
 if st.button("Compute Top Patterns", type="primary"):
     st.session_state["run_discovery"] = True
 
 if not st.session_state.get("run_discovery"):
-    st.info("Click **Compute Top Patterns** to scan all hierarchy combinations and find the largest patterns.")
+    st.info("Click **Compute Top Patterns** to scan all hierarchy combinations and find the top patterns.")
     st.stop()
 
 # Use a hash of the dataframe shape + columns as cache key
 data_hash = f"{len(df)}_{len(labels_df)}_{hash(tuple(df.columns))}"
-patterns = cached_discover(data_hash, df, labels_df, top_n=50)
+patterns = cached_discover(data_hash, df, labels_df, top_n=top_n)
 
 if not patterns:
     st.warning("No patterns found.")
@@ -88,36 +99,44 @@ if "navigate_to_pattern" in st.session_state:
     st.session_state["auto_run"] = True
     st.switch_page("pages/1_profiler.py")
 
+# ── Sort patterns by selected ranking ────────────────────────────────────────
+
+if rank_by == "Silhouette Score":
+    sorted_patterns = sorted(patterns, key=lambda p: p.get("silhouette", 0), reverse=True)[:top_n]
+else:
+    sorted_patterns = sorted(patterns, key=lambda p: p["size"], reverse=True)[:top_n]
+
 # ── Discovery summary metrics ────────────────────────────────────────────────
 
-largest = patterns[0]["size"]
-smallest = patterns[-1]["size"]
+largest = max(p["size"] for p in sorted_patterns)
+smallest = min(p["size"] for p in sorted_patterns)
 n_unique_combos = len({
     (tuple(p["combo"].get("grgr_ck") or []),
      tuple(p["combo"].get("sgsg_ck") or []),
      tuple(p["combo"].get("cspd_cat") or []),
      tuple(p["combo"].get("lobd_id") or []))
-    for p in patterns
+    for p in sorted_patterns
 })
 
 st.divider()
 
 s1, s2, s3, s4 = st.columns(4)
-s1.metric("Patterns Found", len(patterns))
+s1.metric("Patterns Found", len(sorted_patterns))
 s2.metric("Largest Pattern", f"{largest:,}")
-s3.metric("Smallest (in Top 50)", f"{smallest:,}")
+s3.metric(f"Smallest (in Top {top_n})", f"{smallest:,}")
 s4.metric("Unique Combos", n_unique_combos)
 
 # ── Results table ─────────────────────────────────────────────────────────────
 
-st.subheader("Top Patterns by Member Count")
+sort_label = "Silhouette Score" if rank_by == "Silhouette Score" else "Member Count"
+st.subheader(f"Top Patterns by {sort_label}")
 st.caption("Click a row to view it in the Pattern Profiler.")
 
 total_population = df["MEME_CK"].nunique()
 
 table_data = []
-for rank, pattern in enumerate(patterns, 1):
-    table_data.append({
+for rank, pattern in enumerate(sorted_patterns, 1):
+    row = {
         "Rank": str(rank),
         "Group": pattern["grgr_name"],
         "Subgroup": pattern["sgsg_name"],
@@ -126,7 +145,9 @@ for rank, pattern in enumerate(patterns, 1):
         "Pattern": str(pattern["cluster_id"]),
         "Members": f"{pattern['size']:,}",
         "% of Pop": f"{pattern['size'] / total_population * 100:.2f}%",
-    })
+        "Silhouette": f"{pattern.get('silhouette', 0):.4f}",
+    }
+    table_data.append(row)
 
 display_df = pd.DataFrame(table_data)
 event = st.dataframe(
@@ -142,7 +163,7 @@ event = st.dataframe(
 selected_rows = event.selection.rows
 if selected_rows:
     idx = selected_rows[0]
-    selected = patterns[idx]
+    selected = sorted_patterns[idx]
     st.session_state["navigate_to_pattern"] = selected["combo"]
     st.session_state["preselect_k"] = selected["n_patterns"]
     st.session_state["preselect_cluster_id"] = selected["cluster_id"]

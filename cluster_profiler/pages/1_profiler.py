@@ -274,7 +274,7 @@ profiles = profile_all_clusters(subset_members, family_data, assignments)
 
 # ── Header Metrics ────────────────────────────────────────────────────────────
 
-pct_of_total = summary["total_members"] / len(df) * 100
+pct_of_total = summary["total_members"] / df["MEME_CK"].nunique() * 100
 col1, col2, col3 = st.columns(3)
 col1.metric("Subset of Total", f"{pct_of_total:.1f}%")
 col2.metric("Patterns Found", metrics["n_clusters"])
@@ -432,7 +432,7 @@ for container, profile in zip(containers, profiles):
             mask = np.array(assignments) == cid
             raw_df = subset_members.iloc[mask]
 
-            st.markdown("**Generate Synthetic Data**")
+            st.markdown("**Generate Synthetic Data for this Pattern**")
             n_subs = st.number_input(
                 "Number of subscribers",
                 min_value=1, max_value=100000, value=100, step=100,

@@ -122,6 +122,8 @@ def discover_top_patterns(df, labels_df, top_n=50, progress_callback=None):
         profiles = profile_all_clusters(subset_members, family_data, assignments)
         n_patterns = metrics.get("n_clusters", 1)
 
+        silhouette = metrics.get("silhouette", 0.0)
+
         for profile in profiles:
             all_patterns.append({
                 "combo": {
@@ -132,6 +134,7 @@ def discover_top_patterns(df, labels_df, top_n=50, progress_callback=None):
                 },
                 "cluster_id": profile["cluster_id"],
                 "size": profile["size"],
+                "silhouette": silhouette,
                 "n_patterns": n_patterns,
                 "grgr_name": combo["grgr_name"],
                 "sgsg_name": combo["sgsg_name"],
