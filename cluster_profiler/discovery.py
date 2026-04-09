@@ -7,6 +7,9 @@ import streamlit as st
 from cluster_profiler.clustering import discover_clusters
 from cluster_profiler.data_loader import apply_filters
 from cluster_profiler.profiler import profile_all_clusters
+from cluster_profiler.naming import build_contextual_name
+from cluster_profiler.tagging import generate_tags
+from cluster_profiler import db
 
 
 def enumerate_hierarchy_combos(df):
@@ -124,8 +127,22 @@ def discover_top_patterns(df, labels_df, top_n=50, progress_callback=None):
 
         silhouette = metrics.get("silhouette", 0.0)
 
+        total_pop = df["MEME_CK"].nunique()
+
         for profile in profiles:
-            all_patterns.append({
+            pct_of_pop = profile["size"] / total_pop if total_pop > 0 else 0
+
+            # Build contextual name
+            ctx_name = build_contextual_name(
+                grgr_name=combo["grgr_name"],
+                sgsg_name=combo["sgsg_name"],
+                cspd_cat_desc=combo["cspd_cat_desc"],
+                plds_desc=combo["plds_desc"],
+                cluster_id=profile["cluster_id"],
+                profile=profile,
+            )
+
+            pattern_entry = {
                 "combo": {
                     "grgr_ck": combo["grgr_ck"],
                     "sgsg_ck": combo["sgsg_ck"],
@@ -140,7 +157,45 @@ def discover_top_patterns(df, labels_df, top_n=50, progress_callback=None):
                 "sgsg_name": combo["sgsg_name"],
                 "cspd_cat_desc": combo["cspd_cat_desc"],
                 "plds_desc": combo["plds_desc"],
-            })
+                "contextual_name": ctx_name,
+                "profile": profile,
+            }
+            all_patterns.append(pattern_entry)
+
+            # Persist to DB
+            try:
+                pattern_id = db.upsert_pattern(
+                    combo={
+                        "grgr_ck": combo["grgr_ck"],
+                        "sgsg_ck": combo["sgsg_ck"],
+                        "cspd_cat": combo["cspd_cat"],
+                        "lobd_id": combo["lobd_id"],
+                        "grgr_name": combo["grgr_name"],
+                        "sgsg_name": combo["sgsg_name"],
+                        "cspd_cat_desc": combo["cspd_cat_desc"],
+                        "plds_desc": combo["plds_desc"],
+                    },
+                    cluster_id=profile["cluster_id"],
+                    contextual_name=ctx_name,
+                    member_count=profile["size"],
+                    pct_of_pop=pct_of_pop,
+                    silhouette=silhouette,
+                    profile=profile,
+                )
+
+                # Auto-generate and persist tags
+                tags = generate_tags(
+                    grgr_name=combo["grgr_name"],
+                    sgsg_name=combo["sgsg_name"],
+                    cspd_cat_desc=combo["cspd_cat_desc"],
+                    plds_desc=combo["plds_desc"],
+                    profile=profile,
+                    silhouette=silhouette,
+                    pct_of_pop=pct_of_pop,
+                )
+                db.add_tags(pattern_id, tags, source="auto")
+            except Exception:
+                pass  # DB persistence is best-effort during discovery
 
     # Sort by size descending, take top_n
     all_patterns.sort(key=lambda p: p["size"], reverse=True)

@@ -138,11 +138,11 @@ table_data = []
 for rank, pattern in enumerate(sorted_patterns, 1):
     row = {
         "Rank": str(rank),
+        "Pattern Name": pattern.get("contextual_name", f"Pattern {pattern['cluster_id']}"),
         "Group": pattern["grgr_name"],
         "Subgroup": pattern["sgsg_name"],
         "Plan Category": pattern["cspd_cat_desc"],
         "Line of Business": pattern["plds_desc"],
-        "Pattern": str(pattern["cluster_id"]),
         "Members": f"{pattern['size']:,}",
         "% of Pop": f"{pattern['size'] / total_population * 100:.2f}%",
         "Silhouette": f"{pattern.get('silhouette', 0):.4f}",

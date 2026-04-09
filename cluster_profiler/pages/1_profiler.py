@@ -25,6 +25,9 @@ from cluster_profiler.data_loader import apply_filters, load_data
 from cluster_profiler.formatters import format_json
 from cluster_profiler.profiler import build_subset_summary, profile_all_clusters
 from cluster_profiler.synthetic import generate_synthetic_subscribers
+from cluster_profiler.synthetic_claims import generate_synthetic_claims
+from cluster_profiler.synthetic_enrollment import generate_synthetic_enrollments
+from cluster_profiler.naming import build_contextual_name
 
 
 @st.cache_data
@@ -433,8 +436,14 @@ for container, profile in zip(containers, profiles):
             raw_df = subset_members.iloc[mask]
 
             st.markdown("**Generate Synthetic Data for this Pattern**")
-            n_subs = st.number_input(
-                "Number of subscribers",
+
+            gen_type = st.selectbox(
+                "Data type",
+                ["Members", "Claims", "Enrollments"],
+                key=f"gen_type_{cid}",
+            )
+            n_records = st.number_input(
+                f"Number of {'subscribers' if gen_type == 'Members' else 'records'}",
                 min_value=1, max_value=100000, value=100, step=100,
                 key=f"n_subs_{cid}",
             )
@@ -443,15 +452,36 @@ for container, profile in zip(containers, profiles):
             raw_clicked = raw_col.button(f"View Raw Data ({len(raw_df)})", key=f"raw_{cid}")
 
             if gen_clicked:
-                synthetic_df = generate_synthetic_subscribers(
-                    profile, filters_used, n_subs, DEFAULT_REFERENCE_DATE,
-                )
                 safe_name = rule_name.replace(" ", "_").replace("/", "_")
-                output_path = Path(f"data/synthetic_{safe_name}.csv")
+
+                if gen_type == "Members":
+                    result_df = generate_synthetic_subscribers(
+                        profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
+                    )
+                    output_path = Path(f"data/synthetic_members_{safe_name}.csv")
+
+                elif gen_type == "Claims":
+                    member_result = generate_synthetic_subscribers(
+                        profile, filters_used, max(10, n_records // 5), DEFAULT_REFERENCE_DATE,
+                    )
+                    result_df = generate_synthetic_claims(
+                        profile, filters_used, member_result, n_records, DEFAULT_REFERENCE_DATE,
+                    )
+                    output_path = Path(f"data/synthetic_claims_{safe_name}.csv")
+
+                elif gen_type == "Enrollments":
+                    member_result = generate_synthetic_subscribers(
+                        profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
+                    )
+                    result_df = generate_synthetic_enrollments(
+                        member_result, filters_used, DEFAULT_REFERENCE_DATE,
+                    )
+                    output_path = Path(f"data/synthetic_enrollments_{safe_name}.csv")
+
                 output_path.parent.mkdir(parents=True, exist_ok=True)
-                synthetic_df.to_csv(output_path, index=False)
-                st.success(f"Generated {len(synthetic_df)} rows ({n_subs} subscribers) → {output_path}")
-                st.dataframe(synthetic_df.head(20), width="stretch", hide_index=True)
+                result_df.to_csv(output_path, index=False)
+                st.success(f"Generated {len(result_df)} {gen_type.lower()} rows → {output_path}")
+                st.dataframe(result_df.head(20), width="stretch", hide_index=True)
 
             if raw_clicked:
                 st.dataframe(raw_df, width="stretch", height=400)
