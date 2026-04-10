@@ -15,8 +15,8 @@ import streamlit as st
 from cluster_profiler.config import (
     CATEGORICAL_FEATURES,
     CONTINUOUS_FEATURES,
-    DEFAULT_DATA_PATH,
-    DEFAULT_LABELS_PATH,
+    MEMBER_DENORM_PATH,
+    MEMBER_LABELS_PATH,
     DEFAULT_REFERENCE_DATE,
     DESCRIPTION_COLUMNS,
 )
@@ -25,14 +25,15 @@ from cluster_profiler.data_loader import apply_filters, load_data
 from cluster_profiler.formatters import format_json
 from cluster_profiler.profiler import build_subset_summary, profile_all_clusters
 from cluster_profiler.synthetic import generate_synthetic_subscribers
-from cluster_profiler.synthetic_claims import generate_synthetic_claims
+from cluster_profiler.synthetic_claims import generate_synthetic_claims, DenormNotAvailableError
 from cluster_profiler.synthetic_enrollment import generate_synthetic_enrollments
+from cluster_profiler.edi_formatter import enrollment_to_edi
 from cluster_profiler.naming import build_contextual_name
 
 
 @st.cache_data
 def cached_load_data():
-    return load_data(DEFAULT_DATA_PATH, DEFAULT_LABELS_PATH, DEFAULT_REFERENCE_DATE)
+    return load_data(MEMBER_DENORM_PATH, MEMBER_LABELS_PATH, DEFAULT_REFERENCE_DATE)
 
 
 def format_option(key, name):
@@ -118,23 +119,26 @@ def build_save_rule(
 @st.cache_data
 def generate_pattern_summary(profile_json: str, pattern_id: int, total_members: int) -> str:
     """Use Claude to generate a plain-language summary of a pattern profile."""
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=300,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"You are summarizing a member pattern from a health plan population analysis. "
-                f"This is pattern {pattern_id} out of a sub-population of {total_members} members. "
-                f"Write a concise 2-3 sentence plain-language summary describing who these members are "
-                f"based on their demographics, family structure, and categorical attributes. "
-                f"Focus on what makes this group distinctive. Do not use bullet points or headers.\n\n"
-                f"Profile data:\n{profile_json}"
-            ),
-        }],
-    )
-    return message.content[0].text
+    try:
+        client = anthropic.Anthropic()
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"You are summarizing a member pattern from a health plan population analysis. "
+                    f"This is pattern {pattern_id} out of a sub-population of {total_members} members. "
+                    f"Write a concise 2-3 sentence plain-language summary describing who these members are "
+                    f"based on their demographics, family structure, and categorical attributes. "
+                    f"Focus on what makes this group distinctive. Do not use bullet points or headers.\n\n"
+                    f"Profile data:\n{profile_json}"
+                ),
+            }],
+        )
+        return message.content[0].text
+    except Exception:
+        return "(AI summary unavailable — set ANTHROPIC_API_KEY in .env to enable)"
 
 
 # ── Data Loading ──────────────────────────────────────────────────────────────
@@ -454,34 +458,60 @@ for container, profile in zip(containers, profiles):
             if gen_clicked:
                 safe_name = rule_name.replace(" ", "_").replace("/", "_")
 
-                if gen_type == "Members":
-                    result_df = generate_synthetic_subscribers(
-                        profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
-                    )
-                    output_path = Path(f"data/synthetic_members_{safe_name}.csv")
+                try:
+                    if gen_type == "Members":
+                        result_df = generate_synthetic_subscribers(
+                            profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
+                        )
 
-                elif gen_type == "Claims":
-                    member_result = generate_synthetic_subscribers(
-                        profile, filters_used, max(10, n_records // 5), DEFAULT_REFERENCE_DATE,
-                    )
-                    result_df = generate_synthetic_claims(
-                        profile, filters_used, member_result, n_records, DEFAULT_REFERENCE_DATE,
-                    )
-                    output_path = Path(f"data/synthetic_claims_{safe_name}.csv")
+                    elif gen_type == "Claims":
+                        member_result = generate_synthetic_subscribers(
+                            profile, filters_used, max(10, n_records // 5), DEFAULT_REFERENCE_DATE,
+                        )
+                        result_df = generate_synthetic_claims(
+                            profile, filters_used, member_result, n_records, DEFAULT_REFERENCE_DATE,
+                        )
 
-                elif gen_type == "Enrollments":
-                    member_result = generate_synthetic_subscribers(
-                        profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
-                    )
-                    result_df = generate_synthetic_enrollments(
-                        member_result, filters_used, DEFAULT_REFERENCE_DATE,
-                    )
-                    output_path = Path(f"data/synthetic_enrollments_{safe_name}.csv")
+                    elif gen_type == "Enrollments":
+                        member_result = generate_synthetic_subscribers(
+                            profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
+                        )
+                        result_df = generate_synthetic_enrollments(
+                            member_result, filters_used, DEFAULT_REFERENCE_DATE,
+                        )
 
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                result_df.to_csv(output_path, index=False)
-                st.success(f"Generated {len(result_df)} {gen_type.lower()} rows → {output_path}")
-                st.dataframe(result_df.head(20), width="stretch", hide_index=True)
+                    st.success(f"Generated {len(result_df)} {gen_type.lower()} records.")
+                    st.dataframe(result_df.head(20), width="stretch", hide_index=True)
+
+                    dl_col1, dl_col2 = st.columns(2)
+                    dl_col1.download_button(
+                        f"Download {gen_type} CSV",
+                        result_df.to_csv(index=False),
+                        file_name=f"synthetic_{gen_type.lower()}_{safe_name}.csv",
+                        mime="text/csv",
+                        key=f"dl_csv_{cid}_{gen_type}",
+                    )
+
+                    if gen_type == "Enrollments":
+                        edi_content = enrollment_to_edi(result_df)
+                        dl_col2.download_button(
+                            "Download EDI 834",
+                            edi_content,
+                            file_name=f"synthetic_834_{safe_name}.edi",
+                            mime="text/plain",
+                            key=f"dl_edi_{cid}",
+                        )
+
+                    st.caption("Generated data is for export only — it is not stored in the source repository.")
+
+                except DenormNotAvailableError as e:
+                    st.error(str(e))
+                    st.info(
+                        "**What's needed:** The periodic data scoop process must deliver "
+                        "Provider and Claims denormalized models to `data/source/` before "
+                        "claims generation is available. Member and Enrollment generation "
+                        "work with the Member Denorm alone."
+                    )
 
             if raw_clicked:
                 st.dataframe(raw_df, width="stretch", height=400)

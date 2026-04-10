@@ -1,4 +1,16 @@
-"""Generate synthetic subscriber data matching a pattern profile."""
+"""Generate synthetic subscriber/member data matching a pattern profile.
+
+Data sourcing
+-------------
+- Synthetic (generated PII): Names (Faker), DOBs (from age distribution),
+  SSNs (invalid range with S-prefix), Member IDs (sequential from 900000),
+  member status, gender/marital (sampled from pattern distributions).
+- Reused from Member Denorm (via filters_used): GRGR_CK, SGSG_CK, CSPD_CAT,
+  LOBD_ID, GRGR_NAME, SGSG_NAME, CSPD_CAT_DESC, PLDS_DESC, PDDS_DESC —
+  real configuration values from the governed denormalized model.
+- Family structure: Spouse and dependent records generated based on pattern's
+  spouse_rate and avg_dependents statistics.
+"""
 
 import random
 

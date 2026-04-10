@@ -5,25 +5,23 @@ and the system resolves to matching patterns, shows confirmation, and generates 
 """
 
 import json
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from cluster_profiler import db
 from cluster_profiler.keyword_search import parse_query, search, allocate_volume
-from cluster_profiler.config import DEFAULT_DATA_PATH, DEFAULT_LABELS_PATH, DEFAULT_REFERENCE_DATE
-from cluster_profiler.data_loader import load_data, apply_filters
-from cluster_profiler.clustering import discover_clusters
-from cluster_profiler.profiler import profile_all_clusters
+from cluster_profiler.config import MEMBER_DENORM_PATH, MEMBER_LABELS_PATH, DEFAULT_REFERENCE_DATE
+from cluster_profiler.data_loader import load_data
 from cluster_profiler.synthetic import generate_synthetic_subscribers
-from cluster_profiler.synthetic_claims import generate_synthetic_claims
+from cluster_profiler.synthetic_claims import generate_synthetic_claims, DenormNotAvailableError
 from cluster_profiler.synthetic_enrollment import generate_synthetic_enrollments
+from cluster_profiler.edi_formatter import enrollment_to_edi
 
 
 @st.cache_data
 def cached_load_data():
-    return load_data(DEFAULT_DATA_PATH, DEFAULT_LABELS_PATH, DEFAULT_REFERENCE_DATE)
+    return load_data(MEMBER_DENORM_PATH, MEMBER_LABELS_PATH, DEFAULT_REFERENCE_DATE)
 
 
 # ── Init ─────────────────────────────────────────────────────────────────────
@@ -130,6 +128,7 @@ if st.button("Generate Data", type="primary"):
 
     allocation = allocate_volume(results["weights"], volume)
     all_outputs = []
+    denorm_error = None
 
     progress = st.progress(0, text="Generating...")
 
@@ -144,70 +143,88 @@ if st.button("Generate Data", type="primary"):
         )
 
         # Reconstruct filters from pattern
-        import json as _json
         filters = {
-            "grgr_ck": _json.loads(pattern["grgr_ck"]) if pattern["grgr_ck"] else None,
-            "sgsg_ck": _json.loads(pattern["sgsg_ck"]) if pattern["sgsg_ck"] else None,
-            "cspd_cat": _json.loads(pattern["cspd_cat"]) if pattern["cspd_cat"] else None,
-            "lobd_id": _json.loads(pattern["lobd_id"]) if pattern["lobd_id"] else None,
+            "grgr_ck": json.loads(pattern["grgr_ck"]) if pattern["grgr_ck"] else None,
+            "sgsg_ck": json.loads(pattern["sgsg_ck"]) if pattern["sgsg_ck"] else None,
+            "cspd_cat": json.loads(pattern["cspd_cat"]) if pattern["cspd_cat"] else None,
+            "lobd_id": json.loads(pattern["lobd_id"]) if pattern["lobd_id"] else None,
         }
         # Remove None filters
         filters = {k: v for k, v in filters.items() if v is not None}
 
         # Load profile
-        profile = _json.loads(pattern["profile_json"]) if pattern.get("profile_json") else {}
+        profile = json.loads(pattern["profile_json"]) if pattern.get("profile_json") else {}
 
-        if parsed["data_type"] == "members":
-            result_df = generate_synthetic_subscribers(
-                profile, filters, count, DEFAULT_REFERENCE_DATE,
-            )
-        elif parsed["data_type"] == "claims":
-            # First generate members, then claims for them
-            member_result = generate_synthetic_subscribers(
-                profile, filters, max(10, count // 5), DEFAULT_REFERENCE_DATE,
-            )
-            result_df = generate_synthetic_claims(
-                profile, filters, member_result, count, DEFAULT_REFERENCE_DATE,
-            )
-        elif parsed["data_type"] == "enrollments":
-            member_result = generate_synthetic_subscribers(
-                profile, filters, count, DEFAULT_REFERENCE_DATE,
-            )
-            result_df = generate_synthetic_enrollments(
-                member_result, filters, DEFAULT_REFERENCE_DATE,
-            )
-        else:
-            result_df = generate_synthetic_subscribers(
-                profile, filters, count, DEFAULT_REFERENCE_DATE,
-            )
+        try:
+            if parsed["data_type"] == "members":
+                result_df = generate_synthetic_subscribers(
+                    profile, filters, count, DEFAULT_REFERENCE_DATE,
+                )
+            elif parsed["data_type"] == "claims":
+                member_result = generate_synthetic_subscribers(
+                    profile, filters, max(10, count // 5), DEFAULT_REFERENCE_DATE,
+                )
+                result_df = generate_synthetic_claims(
+                    profile, filters, member_result, count, DEFAULT_REFERENCE_DATE,
+                )
+            elif parsed["data_type"] == "enrollments":
+                member_result = generate_synthetic_subscribers(
+                    profile, filters, count, DEFAULT_REFERENCE_DATE,
+                )
+                result_df = generate_synthetic_enrollments(
+                    member_result, filters, DEFAULT_REFERENCE_DATE,
+                )
+            else:
+                result_df = generate_synthetic_subscribers(
+                    profile, filters, count, DEFAULT_REFERENCE_DATE,
+                )
+            all_outputs.append(result_df)
 
-        all_outputs.append(result_df)
+        except DenormNotAvailableError as e:
+            denorm_error = str(e)
+            break
 
     progress.empty()
 
-    if all_outputs:
+    if denorm_error:
+        st.error(denorm_error)
+        st.info(
+            "**What's needed:** The periodic data scoop process must deliver "
+            "Provider and Claims denormalized models to `data/source/` before "
+            "claims generation is available. Try requesting **members** or "
+            "**enrollments** instead — these work with the Member Denorm alone."
+        )
+    elif all_outputs:
         combined = pd.concat(all_outputs, ignore_index=True)
+        file_name = f"synthetic_{parsed['data_type']}_{len(combined)}.csv"
 
-        # Save
-        output_path = Path(f"data/keyword_gen_{parsed['data_type']}_{len(combined)}.csv")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        combined.to_csv(output_path, index=False)
-
-        # Log
+        # Log the generation event (metadata only, not the data itself)
         db.log_generation(
             pattern_ids=list(allocation.keys()),
             data_type=parsed["data_type"],
             volume=len(combined),
-            output_path=str(output_path),
+            output_path=f"(download) {file_name}",
             weighting=results["weights"],
         )
 
-        st.success(f"Generated {len(combined):,} {parsed['data_type']} records → {output_path}")
+        st.success(f"Generated {len(combined):,} {parsed['data_type']} records.")
         st.dataframe(combined.head(20), hide_index=True, width="stretch")
 
-        st.download_button(
+        dl_col1, dl_col2 = st.columns(2)
+        dl_col1.download_button(
             "Download CSV",
             combined.to_csv(index=False),
-            file_name=output_path.name,
+            file_name=file_name,
             mime="text/csv",
         )
+
+        if parsed["data_type"] == "enrollments":
+            edi_content = enrollment_to_edi(combined)
+            dl_col2.download_button(
+                "Download EDI 834",
+                edi_content,
+                file_name=file_name.replace(".csv", ".edi"),
+                mime="text/plain",
+            )
+
+        st.caption("Generated data is for export only — it is not stored in the source repository.")

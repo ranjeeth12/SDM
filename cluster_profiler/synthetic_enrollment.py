@@ -1,7 +1,16 @@
-"""Generate synthetic enrollment data in EDI 834-compatible format.
+"""Generate synthetic enrollment transaction records in 834-compatible tabular format.
 
-Produces enrollment transaction records from a member dataset,
-suitable for downstream EDI file generation or database loading.
+Data sourcing
+-------------
+- Synthetic (generated): Names, DOBs, SSNs, Member IDs, Transaction IDs,
+  transaction dates — these are synthetic PII from the member generation step.
+- Reused from Member Denorm (via member_df): GRGR_CK, SGSG_CK, CSPD_CAT,
+  LOBD_ID, GRGR_NAME, SGSG_NAME, plan descriptions — real configuration
+  values from the governed denormalized model.
+- Coverage dates: Derived from member effective/term dates in the denorm.
+
+This produces tabular enrollment records. Actual EDI 834 wire format
+(ISA/GS/ST/BGN/INS segments) is handled by downstream generation tools.
 """
 
 import numpy as np

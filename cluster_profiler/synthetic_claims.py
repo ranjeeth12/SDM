@@ -1,117 +1,158 @@
-"""Generate synthetic claims data matching a pattern profile.
+"""Generate synthetic claims data using denormalized reference models.
 
-Produces claim-line records with realistic ICD/CPT codes, provider
-assignments, and adjudication outcomes based on pattern demographics
-and probabilistic correlations.
+Principles
+----------
+- Provider NPIs, IDs, specialties → from Provider Denorm (required)
+- ICD/CPT code distributions      → from Claims Denorm (required)
+- Adjudication patterns, amounts  → from Claims Denorm (required)
+- Group/Plan/Benefit keys         → from Member Denorm (via pattern filters)
+- Synthetic (generated) fields    → Claim IDs, service dates, paid dates only
+
+If Provider or Claims denorms are not available, generation is not possible
+and the caller is informed. We do not fabricate reference data.
 """
 
 import numpy as np
 import pandas as pd
 
-try:
-    from faker import Faker
-    _faker = Faker()
-except ImportError:
-    _faker = None
+from .data_loader import load_provider_denorm, load_claims_denorm
 
-
-# ── ICD-10 / CPT reference distributions by age bucket ───────────────────────
-
-_ICD_BY_AGE = {
-    "pediatric": [
-        ("J06.9", 0.25),  # Upper respiratory infection
-        ("J20.9", 0.15),  # Acute bronchitis
-        ("H66.90", 0.12), # Otitis media
-        ("R50.9", 0.10),  # Fever
-        ("Z00.129", 0.20),# Well-child visit
-        ("J45.20", 0.08), # Mild persistent asthma
-        ("K21.0", 0.10),  # GERD
-    ],
-    "adult": [
-        ("Z00.00", 0.15), # General exam
-        ("E11.9", 0.12),  # Type 2 diabetes
-        ("I10", 0.15),    # Essential hypertension
-        ("M54.5", 0.10),  # Low back pain
-        ("J06.9", 0.08),  # Upper respiratory infection
-        ("F41.1", 0.08),  # Generalized anxiety
-        ("E78.5", 0.07),  # Hyperlipidemia
-        ("K21.0", 0.05),  # GERD
-        ("M25.50", 0.05), # Joint pain
-        ("G43.909", 0.05),# Migraine
-        ("Z23", 0.10),    # Immunization
-    ],
-    "senior": [
-        ("I10", 0.18),    # Hypertension
-        ("E11.9", 0.15),  # Type 2 diabetes
-        ("E78.5", 0.10),  # Hyperlipidemia
-        ("M17.11", 0.08), # Knee osteoarthritis
-        ("I25.10", 0.07), # Coronary artery disease
-        ("J44.1", 0.07),  # COPD with exacerbation
-        ("N18.3", 0.05),  # CKD stage 3
-        ("G30.9", 0.04),  # Alzheimer's
-        ("I48.91", 0.05), # Atrial fibrillation
-        ("Z00.00", 0.11), # General exam
-        ("M81.0", 0.05),  # Osteoporosis
-        ("F32.9", 0.05),  # Depression
-    ],
-}
-
-_CPT_BY_ICD = {
-    "Z00.00": [("99395", 0.5), ("99396", 0.5)],
-    "Z00.129": [("99391", 0.3), ("99392", 0.3), ("99393", 0.4)],
-    "Z23": [("90471", 0.5), ("90472", 0.5)],
-    "I10": [("99213", 0.4), ("99214", 0.4), ("80053", 0.2)],
-    "E11.9": [("99214", 0.3), ("83036", 0.4), ("99213", 0.3)],
-    "E78.5": [("80061", 0.5), ("99213", 0.3), ("99214", 0.2)],
-    "M54.5": [("99213", 0.3), ("72148", 0.3), ("97110", 0.4)],
-    "J06.9": [("99213", 0.6), ("87880", 0.4)],
-    "F41.1": [("99214", 0.4), ("90837", 0.6)],
-}
-
-_DENTAL_CODES = [
-    ("D0120", 0.20),  # Periodic oral eval
-    ("D0150", 0.10),  # Comprehensive oral eval
-    ("D1110", 0.25),  # Prophylaxis adult
-    ("D1120", 0.10),  # Prophylaxis child
-    ("D0274", 0.10),  # Bitewing X-rays
-    ("D2391", 0.08),  # Resin filling
-    ("D2750", 0.05),  # Crown
-    ("D7140", 0.05),  # Extraction
-    ("D4341", 0.04),  # Periodontal scaling
-    ("D0220", 0.03),  # Periapical X-ray
-]
-
-_CLAIM_TYPES = {
-    "medical": ["I", "O", "P"],  # Inpatient, Outpatient, Professional
-    "dental": ["D"],
-    "vision": ["V"],
-}
 
 CLAIM_COLUMNS = [
     "CLAIM_ID", "CLAIM_LINE", "MEME_CK", "SBSB_CK",
     "GRGR_CK", "SGSG_CK", "CSPD_CAT", "LOBD_ID",
     "CLAIM_TYPE", "SERVICE_DT", "PAID_DT",
-    "ICD_PRIMARY", "CPT_CODE", "PROVIDER_ID", "PROVIDER_NPI",
+    "ICD_PRIMARY", "CPT_CODE",
+    "PROVIDER_NPI", "PROVIDER_ID", "PROVIDER_SPECIALTY",
     "BILLED_AMT", "ALLOWED_AMT", "PAID_AMT",
     "COPAY_AMT", "COINSURANCE_AMT", "DEDUCTIBLE_AMT",
     "CLAIM_STATUS", "ADJUDICATION",
 ]
 
 
-def _get_age_bucket(mean_age: float) -> str:
-    if mean_age < 18:
-        return "pediatric"
-    if mean_age < 65:
-        return "adult"
-    return "senior"
+class DenormNotAvailableError(Exception):
+    """Raised when a required denormalized model is not available."""
+    pass
 
 
-def _sample_weighted(items: list[tuple], n: int, rng) -> list:
-    """Sample from a list of (value, weight) tuples."""
-    values = [v for v, _ in items]
-    weights = np.array([w for _, w in items], dtype=float)
+def check_denorm_availability():
+    """Check which denorms are available and return status."""
+    provider_df = load_provider_denorm()
+    claims_df = load_claims_denorm()
+    return {
+        "provider_available": provider_df is not None,
+        "claims_available": claims_df is not None,
+        "provider_df": provider_df,
+        "claims_df": claims_df,
+    }
+
+
+def _extract_provider_pool(provider_df, filters_used):
+    """Extract relevant providers from provider denorm based on hierarchy filters.
+
+    Filters by group/subgroup/network if those columns exist in the denorm.
+    Returns a DataFrame of provider rows to sample from.
+    """
+    pool = provider_df.copy()
+
+    # Filter by group if available and filter is set
+    if "GRGR_CK" in pool.columns and filters_used.get("grgr_ck"):
+        pool = pool[pool["GRGR_CK"].isin(filters_used["grgr_ck"])]
+
+    # If filtering emptied the pool, fall back to full provider set
+    if pool.empty:
+        pool = provider_df.copy()
+
+    return pool
+
+
+def _extract_code_distributions(claims_df, filters_used, cspd_cat=None):
+    """Extract ICD/CPT code frequency distributions from claims denorm.
+
+    Returns dict with:
+        icd_dist: list of (code, proportion) tuples
+        cpt_dist: list of (code, proportion) tuples
+        amount_stats: dict with mean/std for billed, allowed, paid
+        adjudication_dist: dict of status → proportion
+    """
+    pool = claims_df.copy()
+
+    # Filter by plan category if available
+    if cspd_cat and "CSPD_CAT" in pool.columns:
+        filtered = pool[pool["CSPD_CAT"] == cspd_cat]
+        if not filtered.empty:
+            pool = filtered
+
+    # Filter by group if available
+    if "GRGR_CK" in pool.columns and filters_used.get("grgr_ck"):
+        filtered = pool[pool["GRGR_CK"].isin(filters_used["grgr_ck"])]
+        if not filtered.empty:
+            pool = filtered
+
+    result = {}
+
+    # ICD distribution
+    if "ICD_PRIMARY" in pool.columns:
+        icd_counts = pool["ICD_PRIMARY"].dropna().value_counts(normalize=True)
+        result["icd_dist"] = list(zip(icd_counts.index, icd_counts.values))
+    else:
+        result["icd_dist"] = []
+
+    # CPT distribution
+    if "CPT_CODE" in pool.columns:
+        cpt_counts = pool["CPT_CODE"].dropna().value_counts(normalize=True)
+        result["cpt_dist"] = list(zip(cpt_counts.index, cpt_counts.values))
+    else:
+        result["cpt_dist"] = []
+
+    # Amount statistics
+    amount_cols = {
+        "billed": "BILLED_AMT", "allowed": "ALLOWED_AMT",
+        "paid": "PAID_AMT", "copay": "COPAY_AMT",
+        "coinsurance": "COINSURANCE_AMT", "deductible": "DEDUCTIBLE_AMT",
+    }
+    amount_stats = {}
+    for key, col in amount_cols.items():
+        if col in pool.columns:
+            vals = pd.to_numeric(pool[col], errors="coerce").dropna()
+            if len(vals) > 0:
+                amount_stats[key] = {
+                    "mean": float(vals.mean()),
+                    "std": float(vals.std()),
+                    "min": float(vals.min()),
+                    "max": float(vals.max()),
+                }
+    result["amount_stats"] = amount_stats
+
+    # Adjudication distribution
+    if "ADJUDICATION" in pool.columns:
+        adj_counts = pool["ADJUDICATION"].dropna().value_counts(normalize=True)
+        result["adjudication_dist"] = dict(zip(adj_counts.index, adj_counts.values))
+    elif "CLAIM_STATUS" in pool.columns:
+        adj_counts = pool["CLAIM_STATUS"].dropna().value_counts(normalize=True)
+        result["adjudication_dist"] = dict(zip(adj_counts.index, adj_counts.values))
+    else:
+        result["adjudication_dist"] = {}
+
+    return result
+
+
+def _sample_from_dist(dist, n, rng):
+    """Sample n values from a list of (value, proportion) tuples."""
+    if not dist:
+        return [""] * n
+    values = [v for v, _ in dist]
+    weights = np.array([w for _, w in dist], dtype=float)
     weights = weights / weights.sum()
     return list(rng.choice(values, size=n, p=weights))
+
+
+def _sample_amount(stats, n, rng):
+    """Sample amounts from a normal distribution based on denorm statistics."""
+    if not stats:
+        return np.zeros(n)
+    vals = rng.normal(stats["mean"], max(stats.get("std", 1), 0.01), size=n)
+    return np.clip(vals, max(stats.get("min", 0), 0), stats.get("max", 10000)).round(2)
 
 
 def generate_synthetic_claims(
@@ -120,6 +161,8 @@ def generate_synthetic_claims(
     member_df: pd.DataFrame,
     n_claims: int,
     reference_date: str = "2025-01-01",
+    provider_df: pd.DataFrame = None,
+    claims_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """Generate synthetic claim lines for members in a pattern.
 
@@ -128,43 +171,65 @@ def generate_synthetic_claims(
     profile : dict
         Pattern profile from profile_cluster().
     filters_used : dict
-        Active hierarchy filters.
+        Active hierarchy filters (from member denorm).
     member_df : pd.DataFrame
-        Member records (from pattern or generated) to assign claims to.
+        Member records to assign claims to (from member denorm or generated).
     n_claims : int
         Number of claim lines to generate.
     reference_date : str
         ISO date for service date generation window.
+    provider_df : pd.DataFrame, optional
+        Provider denorm. If None, attempts to load from config path.
+    claims_df : pd.DataFrame, optional
+        Claims denorm. If None, attempts to load from config path.
 
     Returns
     -------
     pd.DataFrame with CLAIM_COLUMNS.
+
+    Raises
+    ------
+    DenormNotAvailableError
+        If required denorms (provider, claims) are not available.
     """
+    # Load denorms if not provided
+    if provider_df is None:
+        provider_df = load_provider_denorm()
+    if claims_df is None:
+        claims_df = load_claims_denorm()
+
+    # Check availability
+    missing = []
+    if provider_df is None:
+        missing.append("Provider Denorm")
+    if claims_df is None:
+        missing.append("Claims Denorm")
+
+    if missing:
+        raise DenormNotAvailableError(
+            f"Cannot generate claims: {', '.join(missing)} not available. "
+            f"Claims generation requires provider and claims denormalized models "
+            f"to supply NPIs, ICD/CPT distributions, and adjudication patterns. "
+            f"These are populated by the periodic data scoop process."
+        )
+
     rng = np.random.default_rng()
     ref_dt = pd.Timestamp(reference_date)
 
-    # Determine claim domain from plan category
-    cspd_cat = filters_used.get("cspd_cat", [None])
-    if isinstance(cspd_cat, list):
-        cspd_cat = cspd_cat[0] if cspd_cat else None
+    # Get plan category from filters
+    cspd_cat = None
+    if filters_used.get("cspd_cat"):
+        cspd_cat = filters_used["cspd_cat"][0] if isinstance(filters_used["cspd_cat"], list) else filters_used["cspd_cat"]
 
-    cat_lower = (cspd_cat or "M").lower()
-    if cat_lower == "d":
-        domain = "dental"
-    elif cat_lower == "v":
-        domain = "vision"
-    else:
-        domain = "medical"
+    # Extract reference data from denorms
+    provider_pool = _extract_provider_pool(provider_df, filters_used)
+    code_dists = _extract_code_distributions(claims_df, filters_used, cspd_cat)
 
-    # Age bucket for ICD selection
-    age_stats = profile.get("continuous", {}).get("_age", {})
-    age_bucket = _get_age_bucket(age_stats.get("mean", 40))
-
-    # Available members to assign claims to
+    # Member pool to assign claims to
     if member_df is not None and not member_df.empty:
         member_pool = member_df[["MEME_CK", "SBSB_CK"]].values.tolist()
     else:
-        member_pool = [[900000 + i, 800000 + i] for i in range(100)]
+        raise ValueError("Member data is required to generate claims.")
 
     rows = []
     claim_id_start = 700000
@@ -178,44 +243,46 @@ def generate_synthetic_claims(
         service_dt = ref_dt - pd.DateOffset(days=days_back)
         paid_dt = service_dt + pd.DateOffset(days=int(rng.integers(14, 60)))
 
-        # ICD / CPT selection
-        if domain == "dental":
-            code_items = _DENTAL_CODES
-            icd = ""
-            cpt = _sample_weighted(code_items, 1, rng)[0]
-            claim_type = "D"
+        # Provider: sample from provider denorm
+        prov_row = provider_pool.iloc[rng.integers(0, len(provider_pool))]
+        provider_npi = str(prov_row.get("NPI", prov_row.get("PROVIDER_NPI", "")))
+        provider_id = str(prov_row.get("PROVIDER_ID", prov_row.get("PRPR_ID", "")))
+        provider_specialty = str(prov_row.get("SPECIALTY", prov_row.get("PRPR_SPECIALTY", "")))
+
+        # ICD/CPT: sample from claims denorm distributions
+        icd = _sample_from_dist(code_dists["icd_dist"], 1, rng)[0] if code_dists["icd_dist"] else ""
+        cpt = _sample_from_dist(code_dists["cpt_dist"], 1, rng)[0] if code_dists["cpt_dist"] else ""
+
+        # Claim type from claims denorm or derive from plan category
+        if cspd_cat:
+            cat_lower = str(cspd_cat).lower()
+            if cat_lower == "d":
+                claim_type = "D"
+            elif cat_lower == "v":
+                claim_type = "V"
+            else:
+                claim_type = rng.choice(["I", "O", "P"])
         else:
-            icd_items = _ICD_BY_AGE.get(age_bucket, _ICD_BY_AGE["adult"])
-            icd = _sample_weighted(icd_items, 1, rng)[0]
-            cpt_items = _CPT_BY_ICD.get(icd, [("99213", 1.0)])
-            cpt = _sample_weighted(cpt_items, 1, rng)[0]
-            claim_types = _CLAIM_TYPES.get(domain, ["P"])
-            claim_type = rng.choice(claim_types)
+            claim_type = "P"
 
-        # Amounts
-        billed = round(float(rng.uniform(50, 2000)), 2)
-        allowed = round(billed * float(rng.uniform(0.5, 0.9)), 2)
-        copay = round(float(rng.choice([0, 20, 30, 40, 50])), 2)
-        coinsurance = round(allowed * float(rng.uniform(0, 0.2)), 2)
-        deductible = round(float(rng.choice([0, 0, 0, 100, 250, 500])), 2)
-        paid = round(max(0, allowed - copay - coinsurance - deductible), 2)
+        # Amounts: from claims denorm distributions
+        amt_stats = code_dists.get("amount_stats", {})
+        billed = _sample_amount(amt_stats.get("billed"), 1, rng)[0]
+        allowed = _sample_amount(amt_stats.get("allowed"), 1, rng)[0]
+        paid = _sample_amount(amt_stats.get("paid"), 1, rng)[0]
+        copay = _sample_amount(amt_stats.get("copay"), 1, rng)[0]
+        coinsurance = _sample_amount(amt_stats.get("coinsurance"), 1, rng)[0]
+        deductible = _sample_amount(amt_stats.get("deductible"), 1, rng)[0]
 
-        # Provider
-        provider_npi = f"{rng.integers(1000000000, 9999999999)}"
-        provider_id = f"PRV{rng.integers(10000, 99999)}"
-
-        # Adjudication
-        adj_roll = rng.random()
-        if adj_roll < 0.85:
-            adjudication = "APPROVED"
-            claim_status = "PAID"
-        elif adj_roll < 0.95:
-            adjudication = "DENIED"
-            claim_status = "DENIED"
-            paid = 0
+        # Adjudication: from claims denorm distribution
+        adj_dist = code_dists.get("adjudication_dist", {})
+        if adj_dist:
+            adj_items = list(adj_dist.items())
+            adjudication = _sample_from_dist(adj_items, 1, rng)[0]
+            claim_status = adjudication
         else:
-            adjudication = "PENDING"
-            claim_status = "IN_REVIEW"
+            adjudication = ""
+            claim_status = ""
 
         rows.append({
             "CLAIM_ID": f"CLM{claim_id_start + i}",
@@ -231,8 +298,9 @@ def generate_synthetic_claims(
             "PAID_DT": paid_dt.strftime("%Y-%m-%d"),
             "ICD_PRIMARY": icd,
             "CPT_CODE": cpt,
-            "PROVIDER_ID": provider_id,
             "PROVIDER_NPI": provider_npi,
+            "PROVIDER_ID": provider_id,
+            "PROVIDER_SPECIALTY": provider_specialty,
             "BILLED_AMT": billed,
             "ALLOWED_AMT": allowed,
             "PAID_AMT": paid,

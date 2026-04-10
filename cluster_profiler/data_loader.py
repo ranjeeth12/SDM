@@ -1,12 +1,30 @@
-"""Load CSVs, derive features, and apply hierarchy filters."""
+"""Load denormalized models and apply hierarchy filters.
+
+Three denorm models:
+  Member   → demographics, group/plan/benefit hierarchy
+  Provider → NPIs, specialties, networks (optional, loaded when available)
+  Claims   → ICD/CPT correlations, adjudication (optional, loaded when available)
+"""
 
 import pandas as pd
+from pathlib import Path
 
-from .config import FILTER_COLUMNS
+from .config import (
+    FILTER_COLUMNS,
+    MEMBER_DENORM_PATH,
+    MEMBER_LABELS_PATH,
+    PROVIDER_DENORM_PATH,
+    CLAIMS_DENORM_PATH,
+    DEFAULT_REFERENCE_DATE,
+)
 
 
-def load_data(data_path, labels_path, reference_date='2025-01-01'):
-    """Read member and label CSVs, derive _age and _tenure features."""
+def load_member_denorm(data_path=None, labels_path=None, reference_date=None):
+    """Read member denorm and labels, derive _age and _tenure features."""
+    data_path = data_path or MEMBER_DENORM_PATH
+    labels_path = labels_path or MEMBER_LABELS_PATH
+    reference_date = reference_date or DEFAULT_REFERENCE_DATE
+
     df = pd.read_csv(data_path)
     labels_df = pd.read_csv(labels_path)
     ref = pd.Timestamp(reference_date)
@@ -15,6 +33,28 @@ def load_data(data_path, labels_path, reference_date='2025-01-01'):
     df['_tenure'] = (ref - pd.to_datetime(df['MEME_ORIG_EFF_DT'])).dt.days / 30.44
 
     return df, labels_df
+
+
+def load_provider_denorm(path=None):
+    """Load provider denorm if available. Returns DataFrame or None."""
+    path = path or PROVIDER_DENORM_PATH
+    if path is None or not Path(path).exists():
+        return None
+    return pd.read_csv(path)
+
+
+def load_claims_denorm(path=None):
+    """Load claims denorm if available. Returns DataFrame or None."""
+    path = path or CLAIMS_DENORM_PATH
+    if path is None or not Path(path).exists():
+        return None
+    return pd.read_csv(path)
+
+
+# Backward-compatible alias
+def load_data(data_path=None, labels_path=None, reference_date=None):
+    """Alias for load_member_denorm (backward compatibility)."""
+    return load_member_denorm(data_path, labels_path, reference_date)
 
 
 def apply_filters(df, labels_df, grgr_ck=None, sgsg_ck=None, cspd_cat=None, lobd_id=None):

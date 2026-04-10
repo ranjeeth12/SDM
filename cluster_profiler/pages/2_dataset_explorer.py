@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from cluster_profiler.config import (
-    DEFAULT_DATA_PATH, DEFAULT_LABELS_PATH, DEFAULT_REFERENCE_DATE,
+    MEMBER_DENORM_PATH, MEMBER_LABELS_PATH, DEFAULT_REFERENCE_DATE,
 )
 from cluster_profiler.data_loader import load_data
 from cluster_profiler.dataset_explorer import (
@@ -24,7 +24,7 @@ from cluster_profiler.naming import build_contextual_name
 
 @st.cache_data
 def cached_load_data():
-    return load_data(DEFAULT_DATA_PATH, DEFAULT_LABELS_PATH, DEFAULT_REFERENCE_DATE)
+    return load_data(MEMBER_DENORM_PATH, MEMBER_LABELS_PATH, DEFAULT_REFERENCE_DATE)
 
 
 df, labels_df = cached_load_data()
