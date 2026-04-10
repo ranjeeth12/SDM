@@ -26,6 +26,7 @@ landing = st.Page("pages/top_50.py", title="Pattern Discovery", default=True)
 profiler = st.Page("pages/1_profiler.py", title="Pattern Profiler")
 explorer = st.Page("pages/2_dataset_explorer.py", title="Dataset Explorer")
 keyword = st.Page("pages/3_keyword_search.py", title="Keyword Search")
+gen_config = st.Page("pages/4_generation_config.py", title="Generation Config")
 
-nav = st.navigation([landing, profiler, explorer, keyword])
+nav = st.navigation([landing, profiler, explorer, keyword, gen_config])
 nav.run()

@@ -111,12 +111,33 @@ def init_db():
                 created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS generation_rules (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                field_name      TEXT    NOT NULL UNIQUE,
+                field_label     TEXT    NOT NULL,
+                field_category  TEXT    NOT NULL DEFAULT 'id',
+                gen_method      TEXT    NOT NULL DEFAULT 'sequential',
+                data_type       TEXT    NOT NULL DEFAULT 'alphanumeric',
+                length          INTEGER DEFAULT 10,
+                prefix          TEXT    DEFAULT '',
+                postfix         TEXT    DEFAULT '',
+                start_value     INTEGER DEFAULT 1,
+                domain          TEXT    DEFAULT '',
+                format_pattern  TEXT    DEFAULT '',
+                lookup_source   TEXT    DEFAULT '',
+                active          INTEGER DEFAULT 1,
+                updated_by      TEXT    DEFAULT 'system',
+                updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_pattern_tags_tag
                 ON pattern_tags(tag);
             CREATE INDEX IF NOT EXISTS idx_tag_vocab_synonym
                 ON tag_vocabulary(synonym);
             CREATE INDEX IF NOT EXISTS idx_patterns_name
                 ON patterns(contextual_name);
+            CREATE INDEX IF NOT EXISTS idx_gen_rules_field
+                ON generation_rules(field_name);
         """)
 
 
@@ -423,9 +444,104 @@ def get_generation_history(limit=50):
         return [dict(r) for r in rows]
 
 
+# ── Generation Rules ─────────────────────────────────────────────────────────
+
+def upsert_generation_rule(field_name, field_label, field_category="id",
+                            gen_method="sequential", data_type="alphanumeric",
+                            length=10, prefix="", postfix="", start_value=1,
+                            domain="", format_pattern="", lookup_source="",
+                            active=True, updated_by="system"):
+    """Insert or update a generation rule for a data element."""
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO generation_rules
+                (field_name, field_label, field_category, gen_method, data_type,
+                 length, prefix, postfix, start_value, domain, format_pattern,
+                 lookup_source, active, updated_by, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(field_name) DO UPDATE SET
+                field_label     = excluded.field_label,
+                field_category  = excluded.field_category,
+                gen_method      = excluded.gen_method,
+                data_type       = excluded.data_type,
+                length          = excluded.length,
+                prefix          = excluded.prefix,
+                postfix         = excluded.postfix,
+                start_value     = excluded.start_value,
+                domain          = excluded.domain,
+                format_pattern  = excluded.format_pattern,
+                lookup_source   = excluded.lookup_source,
+                active          = excluded.active,
+                updated_by      = excluded.updated_by,
+                updated_at      = datetime('now')
+        """, (
+            field_name, field_label, field_category, gen_method, data_type,
+            length, prefix, postfix, start_value, domain, format_pattern,
+            lookup_source, 1 if active else 0, updated_by,
+        ))
+
+
+def get_generation_rules():
+    """Fetch all generation rules."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM generation_rules ORDER BY field_category, field_name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_generation_rule(field_name):
+    """Fetch a single generation rule by field name."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM generation_rules WHERE field_name = ?", (field_name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def delete_generation_rule(field_name):
+    """Delete a generation rule."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM generation_rules WHERE field_name = ?", (field_name,))
+
+
+def seed_default_generation_rules():
+    """Seed default generation rules for standard data elements."""
+    defaults = [
+        # IDs
+        ("MEME_CK", "Member Key", "id", "sequential", "numeric", 10, "", "", 900000, "", "", ""),
+        ("SBSB_CK", "Subscriber Key", "id", "sequential", "numeric", 10, "", "", 800000, "", "", ""),
+        ("SBSB_ID", "Subscriber ID", "id", "sequential", "alphanumeric", 10, "SB", "", 800000, "", "", ""),
+        ("MEME_SSN", "Member SSN", "id", "sequential", "numeric", 9, "9", "", 10000000, "", "", ""),
+        ("CLAIM_ID", "Claim ID", "id", "sequential", "alphanumeric", 10, "CLM", "", 700000, "", "", ""),
+        ("TRANSACTION_ID", "Transaction ID", "id", "sequential", "alphanumeric", 12, "TXN", "", 500000, "", "", ""),
+        # PII
+        ("MEME_FIRST_NAME", "First Name", "pii", "lookup", "text", 0, "", "", 0, "", "", "first_names"),
+        ("MEME_LAST_NAME", "Last Name", "pii", "lookup", "text", 0, "", "", 0, "", "", "last_names"),
+        # Contact
+        ("EMAIL", "Email Address", "contact", "formatted", "text", 0, "", "", 0, "caresource.com", "{first_initial}{last_name}@{domain}", ""),
+        # Address
+        ("STREET_1", "Street Address 1", "address", "lookup", "text", 0, "", "", 0, "", "{number} {street} {type}", "street_names"),
+        ("STREET_2", "Street Address 2", "address", "formatted", "text", 0, "", "", 0, "", "Apt {number}", ""),
+        ("ZIP_CODE", "ZIP Code", "address", "lookup", "text", 5, "", "", 0, "", "", "zip_city_state"),
+        ("CITY", "City", "address", "derived", "text", 0, "", "", 0, "", "", "zip_city_state"),
+        ("STATE", "State", "address", "derived", "text", 2, "", "", 0, "", "", "zip_city_state"),
+        ("COUNTY", "County", "address", "derived", "text", 0, "", "", 0, "", "", "zip_city_state"),
+    ]
+    for (field_name, label, category, method, dtype, length,
+         prefix, postfix, start, domain, fmt, lookup) in defaults:
+        upsert_generation_rule(
+            field_name=field_name, field_label=label, field_category=category,
+            gen_method=method, data_type=dtype, length=length,
+            prefix=prefix, postfix=postfix, start_value=start,
+            domain=domain, format_pattern=fmt, lookup_source=lookup,
+        )
+
+
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 
 def bootstrap():
     """Initialize DB and seed defaults. Safe to call multiple times."""
     init_db()
     seed_default_vocabulary()
+    seed_default_generation_rules()
