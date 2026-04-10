@@ -116,9 +116,78 @@ def build_save_rule(
     return " AND\n".join(clauses)
 
 
+def _build_local_summary(profile: dict, pattern_id: int, total_members: int) -> str:
+    """Build a plain-language summary from profile data without API call."""
+    parts = []
+    size = profile.get("size", 0)
+    pct = profile.get("pct_of_subset", 0) * 100
+
+    # Age and tenure
+    age_stats = profile.get("continuous", {}).get("_age", {})
+    tenure_stats = profile.get("continuous", {}).get("_tenure", {})
+    if age_stats:
+        mean_age = age_stats.get("mean", 0)
+        parts.append(f"average age {mean_age:.0f}")
+    if tenure_stats:
+        mean_tenure = tenure_stats.get("mean", 0)
+        if mean_tenure >= 60:
+            parts.append(f"long-term members ({mean_tenure:.0f} months average tenure)")
+        elif mean_tenure < 12:
+            parts.append(f"recently enrolled ({mean_tenure:.0f} months average tenure)")
+        else:
+            parts.append(f"{mean_tenure:.0f} months average tenure")
+
+    # Gender
+    sex_pct = profile.get("categorical", {}).get("MEME_SEX", {}).get("pct", {})
+    if sex_pct:
+        m = sex_pct.get("M", 0) * 100
+        f = sex_pct.get("F", 0) * 100
+        if abs(m - f) < 10:
+            parts.append("nearly equal gender distribution")
+        elif m > f:
+            parts.append(f"predominantly male ({m:.0f}%)")
+        else:
+            parts.append(f"predominantly female ({f:.0f}%)")
+
+    # Marital status
+    marital_pct = profile.get("categorical", {}).get("MEME_MARITAL_STATUS", {}).get("pct", {})
+    if marital_pct:
+        married = marital_pct.get("M", 0) * 100
+        if married > 60:
+            parts.append(f"majority married ({married:.0f}%)")
+        elif married < 20:
+            parts.append("mostly unmarried")
+
+    # Family
+    family = profile.get("family", {})
+    avg_dep = family.get("avg_dependents", 0)
+    spouse_rate = family.get("spouse_rate", 0)
+    if avg_dep >= 1.0:
+        parts.append(f"averaging {avg_dep:.1f} dependents")
+    elif avg_dep < 0.3:
+        parts.append("few or no dependents")
+    if spouse_rate > 0.5:
+        parts.append(f"{spouse_rate*100:.0f}% spouse coverage rate")
+
+    # Descriptions
+    descs = profile.get("descriptions", {})
+    locations = descs.get("GRGR_NAME", [])
+
+    location_str = f" in {', '.join(locations)}" if locations else ""
+    detail_str = ", ".join(parts) if parts else "mixed demographics"
+
+    return (
+        f"This group represents {size:,} members ({pct:.1f}% of the subset){location_str}. "
+        f"They are characterized by {detail_str}."
+    )
+
+
 @st.cache_data
 def generate_pattern_summary(profile_json: str, pattern_id: int, total_members: int) -> str:
-    """Use Claude to generate a plain-language summary of a pattern profile."""
+    """Generate a plain-language summary. Uses Claude API if available, local fallback otherwise."""
+    import json as _json
+    profile = _json.loads(profile_json)
+
     try:
         client = anthropic.Anthropic()
         message = client.messages.create(
@@ -138,7 +207,7 @@ def generate_pattern_summary(profile_json: str, pattern_id: int, total_members: 
         )
         return message.content[0].text
     except Exception:
-        return "(AI summary unavailable — set ANTHROPIC_API_KEY in .env to enable)"
+        return _build_local_summary(profile, pattern_id, total_members)
 
 
 # ── Data Loading ──────────────────────────────────────────────────────────────
@@ -296,14 +365,28 @@ st.subheader("Pattern Details")
 if preselect_cluster_id is not None:
     profiles = sorted(profiles, key=lambda p: p["cluster_id"] != preselect_cluster_id)
 
+# Build contextual names for each profile
+_grgr = summary.get("GRGR_NAME", [""])[0] if summary.get("GRGR_NAME") else ""
+_sgsg = summary.get("SGSG_NAME", [""])[0] if summary.get("SGSG_NAME") else ""
+_cat = summary.get("CSPD_CAT_DESC", [""])[0] if summary.get("CSPD_CAT_DESC") else ""
+_lob = summary.get("PLDS_DESC", [""])[0] if summary.get("PLDS_DESC") else ""
+
+profile_names = {}
+for p in profiles:
+    profile_names[p["cluster_id"]] = build_contextual_name(
+        grgr_name=_grgr, sgsg_name=_sgsg,
+        cspd_cat_desc=_cat, plds_desc=_lob,
+        cluster_id=p["cluster_id"], profile=p,
+    )
+
 if len(profiles) <= 8:
-    tab_labels = [f"Pattern {p['cluster_id']}" for p in profiles]
+    tab_labels = [profile_names[p["cluster_id"]] for p in profiles]
     tabs = st.tabs(tab_labels)
     containers = tabs
 else:
     containers = [
         st.expander(
-            f"Pattern {p['cluster_id']}",
+            profile_names[p["cluster_id"]],
             expanded=(p["cluster_id"] == preselect_cluster_id),
         )
         for p in profiles
@@ -401,7 +484,7 @@ for container, profile in zip(containers, profiles):
 
                 rule_name = st.text_input(
                     "Rule name",
-                    value=f"Pattern {profile['cluster_id']}",
+                    value=profile_names.get(profile['cluster_id'], f"Pattern {profile['cluster_id']}"),
                     key=f"rule_name_{profile['cluster_id']}",
                 )
 
@@ -542,7 +625,7 @@ if X.shape[1] >= 2:
                 x=coords[mask, 0], y=coords[mask, 1],
                 mode="markers",
                 marker=dict(color=colors[i % len(colors)], size=5, opacity=0.6),
-                name=f"Pattern {cid}",
+                name=profile_names.get(cid, f"P{cid}"),
                 legendgroup=f"c{cid}",
             ),
             row=1, col=1,
@@ -565,7 +648,7 @@ for i, cid in enumerate(unique_clusters):
             go.Histogram(
                 x=vals, nbinsx=20,
                 marker_color=colors[i % len(colors)],
-                name=f"Pattern {cid}",
+                name=profile_names.get(cid, f"P{cid}"),
                 legendgroup=f"c{cid}",
                 showlegend=False,
             ),
@@ -583,7 +666,7 @@ for i, cid in enumerate(unique_clusters):
             go.Histogram(
                 x=vals, nbinsx=20,
                 marker_color=colors[i % len(colors)],
-                name=f"Pattern {cid}",
+                name=profile_names.get(cid, f"P{cid}"),
                 legendgroup=f"c{cid}",
                 showlegend=False,
             ),
