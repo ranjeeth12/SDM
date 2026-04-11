@@ -318,6 +318,12 @@ run = st.session_state.get("profiler_run", False)
 
 # ── Main Area ─────────────────────────────────────────────────────────────────
 
+st.markdown(
+    '<span style="font-size:13px;color:gray;">'
+    '<a href="/" target="_self" style="color:inherit;text-decoration:none;">Pattern discovery</a>'
+    ' / Pattern profiler</span>',
+    unsafe_allow_html=True,
+)
 st.title("Pattern Profiler")
 
 if not run:
@@ -394,7 +400,84 @@ else:
 
 for container, profile in zip(containers, profiles):
     with container:
-        # ── Summary row: size + AI summary side by side ───────────────
+        cid = profile["cluster_id"]
+        mask = np.array(assignments) == cid
+        raw_df = subset_members.iloc[mask]
+        rule_name = profile_names.get(cid, f"Pattern {cid}")
+
+        # ── Generate data (prominent, at top) ─────────────────────
+        gen_col1, gen_col2, gen_col3, gen_col4, gen_col5 = st.columns([1.5, 1.5, 1, 1.5, 1.5])
+        gen_type = gen_col1.selectbox(
+            "Data type",
+            ["Members", "Claims", "Enrollments"],
+            key=f"gen_type_{cid}",
+            label_visibility="collapsed",
+        )
+        n_records = gen_col2.number_input(
+            "Records",
+            min_value=1, max_value=100000, value=100, step=100,
+            key=f"n_subs_{cid}",
+            label_visibility="collapsed",
+        )
+        gen_clicked = gen_col3.button("Generate", key=f"gen_{cid}", type="primary")
+        raw_clicked = gen_col4.button(f"Raw data ({len(raw_df)})", key=f"raw_{cid}")
+
+        if gen_clicked:
+            safe_name = rule_name.replace(" ", "_").replace("/", "_")
+            try:
+                if gen_type == "Members":
+                    result_df = generate_synthetic_subscribers(
+                        profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
+                        source_data=raw_df,
+                    )
+                elif gen_type == "Claims":
+                    member_result = generate_synthetic_subscribers(
+                        profile, filters_used, max(10, n_records // 5), DEFAULT_REFERENCE_DATE,
+                        source_data=raw_df,
+                    )
+                    result_df = generate_synthetic_claims(
+                        profile, filters_used, member_result, n_records, DEFAULT_REFERENCE_DATE,
+                    )
+                elif gen_type == "Enrollments":
+                    member_result = generate_synthetic_subscribers(
+                        profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
+                        source_data=raw_df,
+                    )
+                    result_df = generate_synthetic_enrollments(
+                        member_result, filters_used, DEFAULT_REFERENCE_DATE,
+                    )
+
+                st.success(f"Generated {len(result_df)} {gen_type.lower()} records.")
+                st.dataframe(result_df.head(20), width="stretch", hide_index=True)
+                dl_col1, dl_col2 = st.columns(2)
+                dl_col1.download_button(
+                    f"Download {gen_type} CSV",
+                    result_df.to_csv(index=False),
+                    file_name=f"synthetic_{gen_type.lower()}_{safe_name}.csv",
+                    mime="text/csv", key=f"dl_csv_{cid}_{gen_type}",
+                )
+                if gen_type == "Enrollments":
+                    edi_content = enrollment_to_edi(result_df)
+                    dl_col2.download_button(
+                        "Download EDI 834", edi_content,
+                        file_name=f"synthetic_834_{safe_name}.edi",
+                        mime="text/plain", key=f"dl_edi_{cid}",
+                    )
+                st.caption("Generated data is for export only — not stored in the source repository.")
+
+            except DenormNotAvailableError as e:
+                st.error(str(e))
+                st.info(
+                    "**What's needed:** Provider and Claims denormalized models must be "
+                    "delivered to `data/source/` before claims generation is available."
+                )
+
+        if raw_clicked:
+            st.dataframe(raw_df, width="stretch", height=400)
+
+        st.divider()
+
+        # ── Summary row: size + AI summary ────────────────────────
         size_pct = profile['pct_of_subset'] * 100
 
         try:
@@ -517,87 +600,6 @@ for container, profile in zip(containers, profiles):
                     else:
                         st.info("No saved rules yet.")
 
-        with st.expander("Data"):
-            cid = profile["cluster_id"]
-            mask = np.array(assignments) == cid
-            raw_df = subset_members.iloc[mask]
-
-            st.markdown("**Generate Synthetic Data for this Pattern**")
-
-            gen_type = st.selectbox(
-                "Data type",
-                ["Members", "Claims", "Enrollments"],
-                key=f"gen_type_{cid}",
-            )
-            n_records = st.number_input(
-                f"Number of {'subscribers' if gen_type == 'Members' else 'records'}",
-                min_value=1, max_value=100000, value=100, step=100,
-                key=f"n_subs_{cid}",
-            )
-            gen_col, raw_col = st.columns(2)
-            gen_clicked = gen_col.button("Generate", key=f"gen_{cid}")
-            raw_clicked = raw_col.button(f"View Raw Data ({len(raw_df)})", key=f"raw_{cid}")
-
-            if gen_clicked:
-                safe_name = rule_name.replace(" ", "_").replace("/", "_")
-
-                try:
-                    if gen_type == "Members":
-                        result_df = generate_synthetic_subscribers(
-                            profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
-                        )
-
-                    elif gen_type == "Claims":
-                        member_result = generate_synthetic_subscribers(
-                            profile, filters_used, max(10, n_records // 5), DEFAULT_REFERENCE_DATE,
-                        )
-                        result_df = generate_synthetic_claims(
-                            profile, filters_used, member_result, n_records, DEFAULT_REFERENCE_DATE,
-                        )
-
-                    elif gen_type == "Enrollments":
-                        member_result = generate_synthetic_subscribers(
-                            profile, filters_used, n_records, DEFAULT_REFERENCE_DATE,
-                        )
-                        result_df = generate_synthetic_enrollments(
-                            member_result, filters_used, DEFAULT_REFERENCE_DATE,
-                        )
-
-                    st.success(f"Generated {len(result_df)} {gen_type.lower()} records.")
-                    st.dataframe(result_df.head(20), width="stretch", hide_index=True)
-
-                    dl_col1, dl_col2 = st.columns(2)
-                    dl_col1.download_button(
-                        f"Download {gen_type} CSV",
-                        result_df.to_csv(index=False),
-                        file_name=f"synthetic_{gen_type.lower()}_{safe_name}.csv",
-                        mime="text/csv",
-                        key=f"dl_csv_{cid}_{gen_type}",
-                    )
-
-                    if gen_type == "Enrollments":
-                        edi_content = enrollment_to_edi(result_df)
-                        dl_col2.download_button(
-                            "Download EDI 834",
-                            edi_content,
-                            file_name=f"synthetic_834_{safe_name}.edi",
-                            mime="text/plain",
-                            key=f"dl_edi_{cid}",
-                        )
-
-                    st.caption("Generated data is for export only — it is not stored in the source repository.")
-
-                except DenormNotAvailableError as e:
-                    st.error(str(e))
-                    st.info(
-                        "**What's needed:** The periodic data scoop process must deliver "
-                        "Provider and Claims denormalized models to `data/source/` before "
-                        "claims generation is available. Member and Enrollment generation "
-                        "work with the Member Denorm alone."
-                    )
-
-            if raw_clicked:
-                st.dataframe(raw_df, width="stretch", height=400)
 
 # ── Visualizations ────────────────────────────────────────────────────────────
 

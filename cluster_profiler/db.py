@@ -506,27 +506,21 @@ def delete_generation_rule(field_name):
 
 
 def seed_default_generation_rules():
-    """Seed default generation rules for standard data elements."""
+    """Seed default generation rules for always-on data elements only.
+
+    Only names and addresses are seeded as defaults.
+    All other elements (IDs, SSN, email, etc.) start unconfigured.
+    User must explicitly define rules for them via the UI.
+    No rule = empty in output.
+    """
     defaults = [
-        # IDs
-        ("MEME_CK", "Member Key", "id", "sequential", "numeric", 10, "", "", 900000, "", "", ""),
-        ("SBSB_CK", "Subscriber Key", "id", "sequential", "numeric", 10, "", "", 800000, "", "", ""),
-        ("SBSB_ID", "Subscriber ID", "id", "sequential", "alphanumeric", 10, "SB", "", 800000, "", "", ""),
-        ("MEME_SSN", "Member SSN", "id", "sequential", "numeric", 9, "9", "", 10000000, "", "", ""),
-        ("CLAIM_ID", "Claim ID", "id", "sequential", "alphanumeric", 10, "CLM", "", 700000, "", "", ""),
-        ("TRANSACTION_ID", "Transaction ID", "id", "sequential", "alphanumeric", 12, "TXN", "", 500000, "", "", ""),
-        # PII
-        ("MEME_FIRST_NAME", "First Name", "pii", "lookup", "text", 0, "", "", 0, "", "", "first_names"),
-        ("MEME_LAST_NAME", "Last Name", "pii", "lookup", "text", 0, "", "", 0, "", "", "last_names"),
-        # Contact
-        ("EMAIL", "Email Address", "contact", "formatted", "text", 0, "", "", 0, "caresource.com", "{first_initial}{last_name}@{domain}", ""),
-        # Address
-        ("STREET_1", "Street Address 1", "address", "lookup", "text", 0, "", "", 0, "", "{number} {street} {type}", "street_names"),
-        ("STREET_2", "Street Address 2", "address", "formatted", "text", 0, "", "", 0, "", "Apt {number}", ""),
-        ("ZIP_CODE", "ZIP Code", "address", "lookup", "text", 5, "", "", 0, "", "", "zip_city_state"),
-        ("CITY", "City", "address", "derived", "text", 0, "", "", 0, "", "", "zip_city_state"),
-        ("STATE", "State", "address", "derived", "text", 2, "", "", 0, "", "", "zip_city_state"),
-        ("COUNTY", "County", "address", "derived", "text", 0, "", "", 0, "", "", "zip_city_state"),
+        # Default — always generated from lookups
+        ("MEME_FIRST_NAME", "Member First Name", "default", "lookup", "text", 0, "", "", 0, "", "", "first_names"),
+        ("MEME_LAST_NAME", "Member Last Name", "default", "lookup", "text", 0, "", "", 0, "", "", "last_names"),
+        ("SBSB_FIRST_NAME", "Subscriber First Name", "default", "lookup", "text", 0, "", "", 0, "", "", "first_names"),
+        ("SBSB_LAST_NAME", "Subscriber Last Name", "default", "lookup", "text", 0, "", "", 0, "", "", "last_names"),
+        ("STREET_1", "Street Address 1", "default", "lookup", "text", 0, "", "", 0, "", "{number} {street} {type}", "street_names"),
+        ("ZIP_CODE", "ZIP Code", "default", "lookup", "text", 5, "", "", 0, "", "", "zip_city_state"),
     ]
     for (field_name, label, category, method, dtype, length,
          prefix, postfix, start, domain, fmt, lookup) in defaults:

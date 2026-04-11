@@ -7,7 +7,7 @@ import sys
 # Support both `python -m cluster_profiler` (relative imports work) and
 # `python cluster_profiler` (no parent package, so use absolute imports).
 if __package__:
-    from .config import DEFAULT_DATA_PATH, DEFAULT_LABELS_PATH, DEFAULT_REFERENCE_DATE
+    from .config import MEMBER_DENORM_PATH, MEMBER_LABELS_PATH, DEFAULT_REFERENCE_DATE
     from .data_loader import apply_filters, load_data
     from .clustering import build_features, discover_clusters
     from .profiler import build_subset_summary, profile_all_clusters
@@ -17,7 +17,7 @@ else:
     _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _repo_root not in sys.path:
         sys.path.insert(0, _repo_root)
-    from cluster_profiler.config import DEFAULT_DATA_PATH, DEFAULT_LABELS_PATH, DEFAULT_REFERENCE_DATE
+    from cluster_profiler.config import MEMBER_DENORM_PATH, MEMBER_LABELS_PATH, DEFAULT_REFERENCE_DATE
     from cluster_profiler.data_loader import apply_filters, load_data
     from cluster_profiler.clustering import build_features, discover_clusters
     from cluster_profiler.profiler import build_subset_summary, profile_all_clusters
@@ -29,11 +29,11 @@ def parse_args(argv=None):
         description='Profile member clusters by hierarchy level.',
     )
     parser.add_argument(
-        '--data', type=str, default=DEFAULT_DATA_PATH,
+        '--data', type=str, default=MEMBER_DENORM_PATH,
         help='Path to generated member CSV',
     )
     parser.add_argument(
-        '--labels', type=str, default=DEFAULT_LABELS_PATH,
+        '--labels', type=str, default=MEMBER_LABELS_PATH,
         help='Path to labels CSV',
     )
     parser.add_argument(
