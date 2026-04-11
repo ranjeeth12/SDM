@@ -52,22 +52,36 @@ method = st.radio(
 meme_cks = []
 
 if method == "Group / Subgroup filter":
-    col1, col2, col3 = st.columns([2, 2, 1])
+    col1, col2 = st.columns(2)
     groups = sorted(df["GRGR_NAME"].unique())
     selected_group = col1.selectbox("Group", [""] + list(groups), key="de_group")
 
+    subset = df
     if selected_group:
-        group_df = df[df["GRGR_NAME"] == selected_group]
-        subgroups = sorted(group_df["SGSG_NAME"].unique())
+        subset = df[df["GRGR_NAME"] == selected_group]
+        subgroups = sorted(subset["SGSG_NAME"].unique())
         selected_subgroup = col2.selectbox("Subgroup", ["All"] + list(subgroups), key="de_sg")
 
         if selected_subgroup != "All":
-            subset = group_df[group_df["SGSG_NAME"] == selected_subgroup]
-        else:
-            subset = group_df
+            subset = subset[subset["SGSG_NAME"] == selected_subgroup]
+
+        # Plan Category (depth 3)
+        col3, col4 = st.columns(2)
+        plan_cats = sorted(subset["CSPD_CAT_DESC"].dropna().unique())
+        selected_plan = col3.selectbox("Plan category", ["All"] + list(plan_cats), key="de_plan")
+
+        if selected_plan != "All":
+            subset = subset[subset["CSPD_CAT_DESC"] == selected_plan]
+
+        # Line of Business (depth 4)
+        lobs = sorted(subset["PLDS_DESC"].dropna().unique())
+        selected_lob = col4.selectbox("Line of business", ["All"] + list(lobs), key="de_lob")
+
+        if selected_lob != "All":
+            subset = subset[subset["PLDS_DESC"] == selected_lob]
 
         meme_cks = subset["MEME_CK"].unique().tolist()
-        col3.metric("Members", f"{len(meme_cks):,}")
+        st.caption(f"Selected {len(meme_cks):,} members")
 
 elif method == "Member IDs":
     ids_input = st.text_area(
@@ -112,7 +126,9 @@ if not results:
 st.subheader(f"2. Pattern associations ({len(results)} found)")
 st.caption("Check patterns to see datasets that satisfy them.")
 
-# Build pattern table with names
+# Build pattern table with names and tags
+from cluster_profiler.tagging import generate_tags
+
 table_data = []
 for i, r in enumerate(results[:30]):
     name = build_contextual_name(
@@ -120,6 +136,29 @@ for i, r in enumerate(results[:30]):
         r["cspd_cat_desc"], r["plds_desc"],
         r["cluster_id"], r.get("profile"),
     )
+
+    # Generate tags for this pattern
+    profile = r.get("profile", {})
+    tags = generate_tags(
+        grgr_name=r["grgr_name"],
+        sgsg_name=r["sgsg_name"],
+        cspd_cat_desc=r["cspd_cat_desc"],
+        plds_desc=r["plds_desc"],
+        profile=profile,
+        silhouette=0,
+        pct_of_pop=r["pct_in_cluster"],
+    )
+    tag_str = ", ".join(tags[:5])
+
+    # Key distinguishing features
+    age_mean = profile.get("continuous", {}).get("_age", {}).get("mean", 0)
+    spouse_rate = profile.get("family", {}).get("spouse_rate", 0)
+    distinguishing = []
+    if age_mean > 0:
+        distinguishing.append(f"age={age_mean:.0f}")
+    if spouse_rate > 0.5:
+        distinguishing.append(f"spouse={spouse_rate*100:.0f}%")
+
     table_data.append({
         "_idx": i,
         "Pattern": name,
@@ -129,10 +168,11 @@ for i, r in enumerate(results[:30]):
         "Group": r["grgr_name"],
         "Plan": r["cspd_cat_desc"],
         "LOB": r["plds_desc"],
+        "Tags": tag_str,
     })
 
 display_df = pd.DataFrame(table_data)
-show_cols = ["Pattern", "Your members", "Total in pattern", "% coverage", "Group", "Plan", "LOB"]
+show_cols = ["Pattern", "Your members", "Total in pattern", "% coverage", "Group", "Plan", "LOB", "Tags"]
 
 event = st.dataframe(
     display_df[show_cols],

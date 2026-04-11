@@ -41,16 +41,19 @@ SOURCE_COLUMNS = [
     "CSPI_ID", "CSPD_CAT", "CSPI_EFF_DT", "CSPI_TERM_DT", "PDPD_ID",
     "CSPI_SEL_IND", "CSPI_HIOS_ID_NVL", "CSPD_CAT_DESC", "CSPD_TYPE",
     "LOBD_ID", "PDPD_RISK_IND", "PDPD_MCTR_CCAT", "PLDS_DESC", "PDDS_DESC",
+    "EMAIL",
 ]
 
-# Fields that are ALWAYS synthetic (PII protection) — never from denorm
-ALWAYS_SYNTHETIC = {
+# Fields that default to synthetic from lookups (PII protection).
+# These are the DEFAULT behavior. If user defines a rule, the rule wins.
+DEFAULT_SYNTHETIC = {
     "MEME_FIRST_NAME", "MEME_LAST_NAME", "MEME_MID_INIT",
     "SBSB_FIRST_NAME", "SBSB_LAST_NAME",
 }
 
-# Fields derived from pattern distributions (not directly sampled from denorm)
-PATTERN_DERIVED = {
+# Fields that default to pattern distributions.
+# These are the DEFAULT behavior. If user defines a rule, the rule wins.
+DEFAULT_PATTERN = {
     "MEME_SEX", "MEME_BIRTH_DT", "MEME_MARITAL_STATUS",
     "MEME_ORIG_EFF_DT", "MEME_SFX", "MEME_REL",
     "SBSB_ORIG_EFF_DT",
@@ -147,16 +150,15 @@ def generate_synthetic_subscribers(
     sub_names = generate_names(n_subscribers, rng=rng)
     addresses = generate_addresses(n_subscribers, state_filter=state_filter, rng=rng)
 
-    # Pre-sample denorm values for all non-PII, non-pattern, non-rule fields
-    # These are the fallback values when no rule is configured
+    # Pre-sample denorm values for ALL fields as baseline fallback.
+    # User rules and defaults will override specific fields afterward.
     denorm_samples = {}
     if source_data is not None and not source_data.empty:
         for col in SOURCE_COLUMNS:
-            if col in ALWAYS_SYNTHETIC or col in PATTERN_DERIVED:
-                continue
-            if col in rules:
-                continue  # User has a rule, will generate
             denorm_samples[col] = _sample_column_from_data(source_data, col, n_subscribers, rng)
+
+    # Fields that need unique values per member (not shared across family)
+    _per_member = {"MEME_CK", "MEME_SSN", "EMAIL", "MEME_MEDCD_NO", "MEME_HICN"}
 
     rows: list[dict] = []
 
@@ -166,36 +168,22 @@ def generate_synthetic_subscribers(
         birth_dt = ref_dt - pd.DateOffset(years=int(round(sub_ages[i])))
         eff_dt = ref_dt - pd.DateOffset(months=int(round(sub_tenures[i])))
 
-        # Build row: start with denorm fallbacks, then overlay
+        # ── Layer 1: Denorm fallback for ALL fields ──────────────
         row = {}
-
-        # 1. Denorm fallback for all non-PII, non-pattern fields
         for col in SOURCE_COLUMNS:
             if col in denorm_samples:
                 row[col] = denorm_samples[col][i]
             else:
                 row[col] = ""
 
-        # 2. User-configured rule overrides
-        for field_name, rule in rules.items():
-            if field_name in ALWAYS_SYNTHETIC:
-                continue  # Handled separately
-            if field_name in PATTERN_DERIVED:
-                continue  # Handled separately
-            if field_name in SOURCE_COLUMNS:
-                if rule.get("gen_method") == "formatted" and rule.get("domain"):
-                    row[field_name] = generate_email(first_name, last_name, rule["domain"], i)
-                else:
-                    row[field_name] = generate_id(rule, 1)[0]
-
-        # 3. Always-synthetic PII
+        # ── Layer 2: Default synthetic PII (names from lookups) ──
         row["MEME_FIRST_NAME"] = first_name
         row["MEME_LAST_NAME"] = last_name
         row["MEME_MID_INIT"] = ""
         row["SBSB_FIRST_NAME"] = first_name
         row["SBSB_LAST_NAME"] = last_name
 
-        # 4. Pattern-derived demographics
+        # ── Layer 3: Default pattern-derived demographics ────────
         row["MEME_SEX"] = sub_sexes[i]
         row["MEME_BIRTH_DT"] = birth_dt.strftime("%Y-%m-%d")
         row["MEME_MARITAL_STATUS"] = sub_marital[i]
@@ -204,10 +192,49 @@ def generate_synthetic_subscribers(
         row["MEME_SFX"] = 1
         row["MEME_REL"] = "M"
 
-        # 5. Address from lookups (state-filtered)
+        # ── Layer 4: Address from lookups ────────────────────────
         row["SGSG_STATE"] = addr.get("state", row.get("SGSG_STATE", ""))
         row["GRGR_STATE"] = addr.get("state", row.get("GRGR_STATE", ""))
         row["GRGR_COUNTY"] = addr.get("county", row.get("GRGR_COUNTY", ""))
+        row["EMAIL"] = generate_email(first_name, last_name, "caresource.com", i)
+
+        # ── Layer 5: User rules override EVERYTHING ──────────────
+        # Skip default system rules (names/addresses already handled
+        # in Layers 2-4). Only apply user-modified rules.
+        for field_name, rule in rules.items():
+            if field_name not in SOURCE_COLUMNS:
+                continue
+            # Skip default system rules — they're handled in Layers 2-4
+            if rule.get("updated_by") == "system" and rule.get("field_category") in ("default",):
+                continue
+
+            method = rule.get("gen_method", "")
+            if method == "formatted" and rule.get("domain"):
+                row[field_name] = generate_email(first_name, last_name, rule["domain"], i)
+            elif method == "lookup":
+                lookup_src = rule.get("lookup_source", "")
+                if lookup_src == "first_names":
+                    extra_names = generate_names(1, rng=rng)
+                    row[field_name] = extra_names[0][0]
+                elif lookup_src == "last_names":
+                    extra_names = generate_names(1, rng=rng)
+                    row[field_name] = extra_names[0][1]
+                elif lookup_src in ("street_names", "zip_city_state"):
+                    extra_addr = generate_addresses(1, state_filter=state_filter, rng=rng)
+                    if "ZIP" in field_name:
+                        row[field_name] = extra_addr[0]["zip"]
+                    elif "CITY" in field_name:
+                        row[field_name] = extra_addr[0]["city"]
+                    elif "STATE" in field_name:
+                        row[field_name] = extra_addr[0]["state"]
+                    elif "COUNTY" in field_name:
+                        row[field_name] = extra_addr[0]["county"]
+                    else:
+                        row[field_name] = extra_addr[0]["street_1"]
+                else:
+                    row[field_name] = generate_id(rule, 1)[0]
+            else:
+                row[field_name] = generate_id(rule, 1)[0]
 
         rows.append(row)
 
@@ -219,7 +246,7 @@ def generate_synthetic_subscribers(
             sp_age = sub_ages[i] + rng.normal(0, 3)
             sp_birth = ref_dt - pd.DateOffset(years=int(round(max(sp_age, 18))))
 
-            sp_row = dict(row)  # Copy subscriber's row (inherits denorm values)
+            sp_row = dict(row)  # Copy subscriber's row (inherits denorm + family values)
             sp_row["MEME_FIRST_NAME"] = sp_first
             sp_row["MEME_SEX"] = sp_sex
             sp_row["MEME_BIRTH_DT"] = sp_birth.strftime("%Y-%m-%d")
@@ -227,12 +254,15 @@ def generate_synthetic_subscribers(
             sp_row["MEME_REL"] = "S"
             sp_row["MEME_MARITAL_STATUS"] = sub_marital[i]
 
-            # Override IDs if rules exist (new unique values for spouse)
+            # Generate new unique values for per-member rule fields
             for field_name, rule in rules.items():
-                if field_name in ALWAYS_SYNTHETIC or field_name in PATTERN_DERIVED:
+                if field_name not in SOURCE_COLUMNS:
                     continue
-                if field_name in SOURCE_COLUMNS and field_name in ("MEME_CK", "MEME_SSN"):
-                    sp_row[field_name] = generate_id(rule, 1)[0]
+                if field_name in _per_member:
+                    if rule.get("gen_method") == "formatted" and rule.get("domain"):
+                        sp_row[field_name] = generate_email(sp_first, last_name, rule["domain"], i * 100 + 1)
+                    else:
+                        sp_row[field_name] = generate_id(rule, 1)[0]
 
             rows.append(sp_row)
 
@@ -253,12 +283,15 @@ def generate_synthetic_subscribers(
             dep_row["MEME_REL"] = "D"
             dep_row["MEME_MARITAL_STATUS"] = ""
 
-            # Override IDs if rules exist
+            # Generate new unique values for per-member rule fields
             for field_name, rule in rules.items():
-                if field_name in ALWAYS_SYNTHETIC or field_name in PATTERN_DERIVED:
+                if field_name not in SOURCE_COLUMNS:
                     continue
-                if field_name in SOURCE_COLUMNS and field_name in ("MEME_CK", "MEME_SSN"):
-                    dep_row[field_name] = generate_id(rule, 1)[0]
+                if field_name in _per_member:
+                    if rule.get("gen_method") == "formatted" and rule.get("domain"):
+                        dep_row[field_name] = generate_email(dep_first, last_name, rule["domain"], i * 100 + sfx)
+                    else:
+                        dep_row[field_name] = generate_id(rule, 1)[0]
 
             rows.append(dep_row)
             sfx += 1

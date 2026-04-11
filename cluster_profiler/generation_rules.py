@@ -77,12 +77,21 @@ class SequenceCounter:
 
 
 def generate_id(rule: dict, n: int = 1) -> list[str]:
-    """Generate n ID values using the rule configuration."""
+    """Generate n ID values using the rule configuration.
+
+    Leading zeros: when length > 0, the numeric portion is zero-padded
+    to fill (length - prefix_len - postfix_len) characters.
+    e.g., prefix="SB", length=10, value=1 → "SB00000001"
+    """
     prefix = rule.get("prefix", "")
     postfix = rule.get("postfix", "")
     length = rule.get("length", 10)
     start = rule.get("start_value", 1)
     method = rule.get("gen_method", "sequential")
+    data_type = rule.get("data_type", "alphanumeric")
+
+    # Available width for the numeric portion
+    num_width = max(1, length - len(prefix) - len(postfix)) if length > 0 else 0
 
     results = []
     for _ in range(n):
@@ -91,17 +100,24 @@ def generate_id(rule: dict, n: int = 1) -> list[str]:
             num_str = str(val)
         elif method == "random":
             rng = np.random.default_rng()
-            max_val = 10 ** max(1, length - len(prefix) - len(postfix)) - 1
-            val = int(rng.integers(1, max_val))
+            max_val = 10 ** max(1, num_width) - 1
+            val = int(rng.integers(1, max(2, max_val)))
             num_str = str(val)
+        elif method == "constant":
+            num_str = str(prefix)
+            prefix = ""  # constant uses prefix as the value itself
         else:
             val = SequenceCounter.next(rule["field_name"], start)
             num_str = str(val)
 
-        # Apply prefix and postfix
+        # Zero-pad the numeric portion if length is specified
+        if length > 0 and method != "constant":
+            num_str = num_str.zfill(num_width)
+
+        # Assemble
         result = f"{prefix}{num_str}{postfix}"
 
-        # Truncate or pad to length if specified
+        # Truncate to length if specified (from the right)
         if length > 0:
             result = result[:length]
 

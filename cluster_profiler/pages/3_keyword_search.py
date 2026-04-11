@@ -6,6 +6,7 @@ and the system resolves to matching patterns, shows confirmation, and generates 
 
 import json
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -92,9 +93,9 @@ if not patterns:
 st.subheader(f"Found {len(patterns)} Matching Patterns")
 st.caption(f"Total members across matches: {results['total_members']:,}")
 
-# Display matching patterns
+# Display matching patterns with multi-select
 table_data = []
-for p in patterns[:20]:
+for p in patterns[:30]:
     tags = db.get_tags(p["id"])
     tag_str = ", ".join(t["tag"] for t in tags[:6])
     table_data.append({
@@ -107,7 +108,34 @@ for p in patterns[:20]:
         "Tags": tag_str,
     })
 
-st.dataframe(pd.DataFrame(table_data), hide_index=True, width="stretch")
+# Select all toggle
+select_all = st.checkbox("Select all patterns", value=True, key="kw_select_all")
+
+event = st.dataframe(
+    pd.DataFrame(table_data),
+    hide_index=True, width="stretch",
+    height=min(350, len(table_data) * 38 + 40),
+    on_select="rerun",
+    selection_mode="multi-row",
+)
+
+# Determine selected patterns
+if select_all:
+    selected_patterns = patterns[:len(table_data)]
+else:
+    selected_indices = event.selection.rows
+    if not selected_indices:
+        st.info("Select patterns above or check **Select all** to proceed with generation.")
+        st.stop()
+    selected_patterns = [patterns[i] for i in selected_indices]
+
+# Recompute weights for selected subset
+selected_total = sum(p["member_count"] for p in selected_patterns)
+selected_weights = {}
+for p in selected_patterns:
+    selected_weights[p["id"]] = round(p["member_count"] / selected_total, 4) if selected_total > 0 else 0
+
+st.markdown(f"**{len(selected_patterns)} patterns selected** · {selected_total:,} total members")
 
 # ── Generation ───────────────────────────────────────────────────────────────
 
@@ -119,21 +147,21 @@ volume = parsed["volume"] or st.number_input(
 
 confirmation = (
     f"**Ready to generate {volume:,} {parsed['data_type']}** "
-    f"from {len(patterns)} patterns using weighted distribution."
+    f"from {len(selected_patterns)} selected patterns using weighted distribution."
 )
 st.markdown(confirmation)
 
 if st.button("Generate Data", type="primary"):
     df, labels_df = cached_load_data()
 
-    allocation = allocate_volume(results["weights"], volume)
+    allocation = allocate_volume(selected_weights, volume)
     all_outputs = []
     denorm_error = None
 
     progress = st.progress(0, text="Generating...")
 
     for i, (pattern_id, count) in enumerate(allocation.items()):
-        pattern = next((p for p in patterns if p["id"] == pattern_id), None)
+        pattern = next((p for p in selected_patterns if p["id"] == pattern_id), None)
         if not pattern:
             continue
 
@@ -155,14 +183,32 @@ if st.button("Generate Data", type="primary"):
         # Load profile
         profile = json.loads(pattern["profile_json"]) if pattern.get("profile_json") else {}
 
+        # Load source data (denorm records for this pattern) for fallback
+        raw_df = None
+        try:
+            from cluster_profiler.data_loader import apply_filters
+            from cluster_profiler.clustering import discover_clusters
+            subset_m, subset_l, _, f_used = apply_filters(
+                df, labels_df, **{k: v if isinstance(v, list) else [v] for k, v in filters.items()},
+            )
+            assignments, _ = discover_clusters(subset_m, subset_l, k=None, use_labels=False, filters_used=f_used)
+            cid = pattern.get("cluster_id", 0)
+            mask = np.array(assignments) == cid
+            if mask.any():
+                raw_df = subset_m.iloc[mask]
+        except Exception:
+            pass  # Fall back to no source data
+
         try:
             if parsed["data_type"] == "members":
                 result_df = generate_synthetic_subscribers(
                     profile, filters, count, DEFAULT_REFERENCE_DATE,
+                    source_data=raw_df,
                 )
             elif parsed["data_type"] == "claims":
                 member_result = generate_synthetic_subscribers(
                     profile, filters, max(10, count // 5), DEFAULT_REFERENCE_DATE,
+                    source_data=raw_df,
                 )
                 result_df = generate_synthetic_claims(
                     profile, filters, member_result, count, DEFAULT_REFERENCE_DATE,
@@ -170,6 +216,7 @@ if st.button("Generate Data", type="primary"):
             elif parsed["data_type"] == "enrollments":
                 member_result = generate_synthetic_subscribers(
                     profile, filters, count, DEFAULT_REFERENCE_DATE,
+                    source_data=raw_df,
                 )
                 result_df = generate_synthetic_enrollments(
                     member_result, filters, DEFAULT_REFERENCE_DATE,
@@ -177,6 +224,7 @@ if st.button("Generate Data", type="primary"):
             else:
                 result_df = generate_synthetic_subscribers(
                     profile, filters, count, DEFAULT_REFERENCE_DATE,
+                    source_data=raw_df,
                 )
             all_outputs.append(result_df)
 

@@ -6,6 +6,7 @@ Flow:
   3. Subsequent visits → instant load from DB
 """
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -279,9 +280,22 @@ if selected_rows:
     # Inline quick generate
     if btn2.button("Quick generate members", key="preview_gen_members"):
         from cluster_profiler.synthetic import generate_synthetic_subscribers
+        from cluster_profiler.data_loader import apply_filters
+        from cluster_profiler.clustering import discover_clusters
         from cluster_profiler.config import DEFAULT_REFERENCE_DATE
         filters = {k: v for k, v in combo.items() if v is not None}
-        result = generate_synthetic_subscribers(profile, filters, 100, DEFAULT_REFERENCE_DATE)
+        # Load source data for denorm fallback
+        raw_df = None
+        try:
+            subset_m, subset_l, _, f_used = apply_filters(df, labels_df, **filters)
+            assignments, _ = discover_clusters(subset_m, subset_l, k=None, use_labels=False, filters_used=f_used)
+            cid = pattern.get("cluster_id", 0)
+            mask = np.array(assignments) == cid
+            if mask.any():
+                raw_df = subset_m.iloc[mask]
+        except Exception:
+            pass
+        result = generate_synthetic_subscribers(profile, filters, 100, DEFAULT_REFERENCE_DATE, source_data=raw_df)
         st.success(f"Generated {len(result)} member records.")
         st.dataframe(result.head(20), hide_index=True, width="stretch")
         st.download_button("Download CSV", result.to_csv(index=False),
@@ -293,9 +307,21 @@ if selected_rows:
         from cluster_profiler.synthetic import generate_synthetic_subscribers
         from cluster_profiler.synthetic_enrollment import generate_synthetic_enrollments
         from cluster_profiler.edi_formatter import enrollment_to_edi
+        from cluster_profiler.data_loader import apply_filters
+        from cluster_profiler.clustering import discover_clusters
         from cluster_profiler.config import DEFAULT_REFERENCE_DATE
         filters = {k: v for k, v in combo.items() if v is not None}
-        members = generate_synthetic_subscribers(profile, filters, 100, DEFAULT_REFERENCE_DATE)
+        raw_df = None
+        try:
+            subset_m, subset_l, _, f_used = apply_filters(df, labels_df, **filters)
+            assignments, _ = discover_clusters(subset_m, subset_l, k=None, use_labels=False, filters_used=f_used)
+            cid = pattern.get("cluster_id", 0)
+            mask = np.array(assignments) == cid
+            if mask.any():
+                raw_df = subset_m.iloc[mask]
+        except Exception:
+            pass
+        members = generate_synthetic_subscribers(profile, filters, 100, DEFAULT_REFERENCE_DATE, source_data=raw_df)
         enrollments = generate_synthetic_enrollments(members, filters, DEFAULT_REFERENCE_DATE)
         st.success(f"Generated {len(enrollments)} enrollment records.")
         st.dataframe(enrollments.head(20), hide_index=True, width="stretch")
