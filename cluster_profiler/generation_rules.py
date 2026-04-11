@@ -82,43 +82,40 @@ def generate_id(rule: dict, n: int = 1) -> list[str]:
     Leading zeros: when length > 0, the numeric portion is zero-padded
     to fill (length - prefix_len - postfix_len) characters.
     e.g., prefix="SB", length=10, value=1 → "SB00000001"
+
+    Length is always enforced — output is truncated if longer.
     """
-    prefix = rule.get("prefix", "")
-    postfix = rule.get("postfix", "")
-    length = rule.get("length", 10)
-    start = rule.get("start_value", 1)
+    pfx = rule.get("prefix", "") or ""
+    pstfx = rule.get("postfix", "") or ""
+    length = rule.get("length", 0) or 0
+    start = rule.get("start_value", 1) or 1
     method = rule.get("gen_method", "sequential")
-    data_type = rule.get("data_type", "alphanumeric")
 
     # Available width for the numeric portion
-    num_width = max(1, length - len(prefix) - len(postfix)) if length > 0 else 0
+    num_width = max(1, length - len(pfx) - len(pstfx)) if length > 0 else 0
 
     results = []
     for _ in range(n):
-        if method == "sequential":
+        if method == "constant":
+            # Constant: prefix IS the value, no numeric portion
+            result = pfx
+        elif method == "sequential":
             val = SequenceCounter.next(rule["field_name"], start)
-            num_str = str(val)
+            num_str = str(val).zfill(num_width) if length > 0 else str(val)
+            result = f"{pfx}{num_str}{pstfx}"
         elif method == "random":
             rng = np.random.default_rng()
             max_val = 10 ** max(1, num_width) - 1
             val = int(rng.integers(1, max(2, max_val)))
-            num_str = str(val)
-        elif method == "constant":
-            num_str = str(prefix)
-            prefix = ""  # constant uses prefix as the value itself
+            num_str = str(val).zfill(num_width) if length > 0 else str(val)
+            result = f"{pfx}{num_str}{pstfx}"
         else:
             val = SequenceCounter.next(rule["field_name"], start)
-            num_str = str(val)
+            num_str = str(val).zfill(num_width) if length > 0 else str(val)
+            result = f"{pfx}{num_str}{pstfx}"
 
-        # Zero-pad the numeric portion if length is specified
-        if length > 0 and method != "constant":
-            num_str = num_str.zfill(num_width)
-
-        # Assemble
-        result = f"{prefix}{num_str}{postfix}"
-
-        # Truncate to length if specified (from the right)
-        if length > 0:
+        # Enforce max length — always truncate if longer
+        if length > 0 and len(result) > length:
             result = result[:length]
 
         results.append(result)

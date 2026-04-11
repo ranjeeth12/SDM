@@ -59,7 +59,7 @@ def run_fresh_discovery(df, labels_df, top_n=50):
 
 db.bootstrap()
 
-st.title("Pattern Discovery")
+st.title("System Discovered Patterns")
 st.caption(
     "Discover the top patterns across all valid hierarchy "
     "combinations (Group, Subgroup, Plan Category, Line of Business) at every depth, "

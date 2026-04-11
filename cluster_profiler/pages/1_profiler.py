@@ -320,7 +320,7 @@ run = st.session_state.get("profiler_run", False)
 
 st.markdown(
     '<span style="font-size:13px;color:gray;">'
-    '<a href="/" target="_self" style="color:inherit;text-decoration:none;">Pattern discovery</a>'
+    '<a href="/" target="_self" style="color:inherit;text-decoration:none;">System discovered patterns</a>'
     ' / Pattern profiler</span>',
     unsafe_allow_html=True,
 )

@@ -1,12 +1,12 @@
-"""Generation Configuration — every data element is configurable.
+"""Generation Configuration — context-aware rule management for all data elements.
 
-Every element shows its default source (denorm, pattern, lookup) but can be
-overridden with a user-defined rule. No element is locked from configuration.
-
-Default source types (what happens without a user rule):
-  denorm     → Value sampled from pattern source data
-  pattern    → Derived from pattern distributions (age, gender, marital)
-  lookup     → From governed lookup CSV (names, addresses)
+Forms adapt based on field type:
+  ID fields    → method, length, prefix, start value
+  Name fields  → lookup source
+  Email fields → domain, local-part method
+  Date fields  → method (sequential, constant)
+  Status fields → constant value or lookup
+  Other        → full options
 """
 
 import pandas as pd
@@ -19,10 +19,7 @@ from cluster_profiler.generation_rules import (
     SequenceCounter,
 )
 
-# ── Master Element Registry ──────────────────────────────────────────────────
-# (field_name): (default_source, label)
-# default_source is what happens when NO user rule is defined.
-# Every element can be overridden with a user rule.
+# ── Element Registry ─────────────────────────────────────────────────────────
 
 ELEMENT_REGISTRY = {
     "GRGR_CK":           ("denorm", "Group Key"),
@@ -87,24 +84,39 @@ ELEMENT_REGISTRY = {
 }
 
 
+def _detect_field_type(field_name: str, label: str) -> str:
+    """Detect the field type for context-aware form rendering."""
+    fn = field_name.upper()
+    lb = label.lower()
+    if "email" in lb or "email" in fn.lower():
+        return "email"
+    if fn.endswith("_NAME") or "FIRST_NAME" in fn or "LAST_NAME" in fn or "MID_INIT" in fn:
+        return "name"
+    if fn.endswith("_CK") or fn.endswith("_ID") or fn == "MEME_SSN" or fn == "MEME_MEDCD_NO" or fn == "MEME_HICN":
+        return "id"
+    if fn.endswith("_DT"):
+        return "date"
+    if "_STS" in fn or "STATUS" in lb:
+        return "status"
+    if "_DESC" in fn or "_NAME" in fn:
+        return "text"
+    return "general"
+
+
 db.bootstrap()
 
 st.title("Generation Configuration")
 st.caption(
     "Every data element is configurable. Without a rule, values come from the "
-    "default source (denorm, pattern distribution, or lookup). "
-    "Define a rule to override any element with synthetic values."
+    "default source. Define a rule to override with synthetic values."
 )
 
-# Legend
 st.markdown(
-    ":orange[**Denorm**] Default: from source data · "
-    ":violet[**Pattern**] Default: from distributions · "
-    ":green[**Lookup**] Default: from governed CSV · "
+    ":orange[**Denorm**] From source data · "
+    ":violet[**Pattern**] From distributions · "
+    ":green[**Lookup**] From governed CSV · "
     ":blue[**Rule defined**] User override active"
 )
-
-st.markdown("")
 
 # ── Load rules ───────────────────────────────────────────────────────────────
 
@@ -113,39 +125,29 @@ rules_by_field = {r["field_name"]: r for r in rules_list}
 
 # ── Filter ───────────────────────────────────────────────────────────────────
 
-filter_options = ["All", "Has rule", "No rule"]
-status_filter = st.radio("Show", filter_options, horizontal=True, label_visibility="collapsed")
+status_filter = st.radio("Show", ["All", "Has rule", "No rule"], horizontal=True, label_visibility="collapsed")
 
 # ── Build grid ───────────────────────────────────────────────────────────────
 
 grid_data = []
 for field_name, (default_source, label) in ELEMENT_REGISTRY.items():
     rule = rules_by_field.get(field_name)
+    has_rule = rule is not None and rule.get("updated_by") != "system"
 
-    if rule:
+    if has_rule:
         status = "Rule defined"
         parts = [rule.get("gen_method", "")]
         if rule.get("prefix"): parts.append(f"prefix={rule['prefix']}")
         if rule.get("length") and rule["length"] > 0: parts.append(f"len={rule['length']}")
-        if rule.get("start_value") and rule["start_value"] > 0: parts.append(f"start={rule['start_value']}")
         if rule.get("domain"): parts.append(f"domain={rule['domain']}")
-        if rule.get("lookup_source"): parts.append(f"lookup={rule['lookup_source']}")
         source_text = ", ".join(parts)
     else:
         status = f"Default ({default_source})"
-        if default_source == "denorm":
-            source_text = "Sampled from pattern source data"
-        elif default_source == "pattern":
-            source_text = "From pattern distribution"
-        elif default_source == "lookup":
-            source_text = "From governed lookup CSV"
-        else:
-            source_text = default_source
+        source_text = {"denorm": "From source data", "pattern": "From distribution", "lookup": "From lookup CSV"}.get(default_source, default_source)
 
-    # Apply filter
     if status_filter == "All" or \
-       (status_filter == "Has rule" and rule) or \
-       (status_filter == "No rule" and not rule):
+       (status_filter == "Has rule" and has_rule) or \
+       (status_filter == "No rule" and not has_rule):
         grid_data.append({
             "Field": field_name,
             "Label": label,
@@ -161,8 +163,7 @@ if not grid_data:
 display_df = pd.DataFrame(grid_data)[["Field", "Label", "Status", "Source / Rule"]]
 
 event = st.dataframe(
-    display_df,
-    hide_index=True, width="stretch",
+    display_df, hide_index=True, width="stretch",
     height=min(450, len(grid_data) * 38 + 40),
     on_select="rerun", selection_mode="single-row",
 )
@@ -179,100 +180,92 @@ field_name = grid_data[idx]["Field"]
 label = ELEMENT_REGISTRY[field_name][1]
 default_source = ELEMENT_REGISTRY[field_name][0]
 existing_rule = rules_by_field.get(field_name)
+is_user_rule = existing_rule and existing_rule.get("updated_by") != "system"
+field_type = _detect_field_type(field_name, label)
 
 st.divider()
 
 hdr1, hdr2 = st.columns([3, 1])
 hdr1.subheader(field_name)
-hdr1.caption(label)
+hdr1.caption(f"{label} · Type: {field_type}")
 
-if existing_rule:
+if is_user_rule:
     hdr2.markdown(":blue[**Rule defined**]")
 else:
     color = {"denorm": "orange", "pattern": "violet", "lookup": "green"}.get(default_source, "gray")
     hdr2.markdown(f":{color}[**Default: {default_source}**]")
 
-if not existing_rule:
-    st.markdown(
-        f"No rule defined. This field currently uses **{default_source}** values. "
-        "Define a rule below to override with synthetic values."
-    )
+if not is_user_rule:
+    st.markdown(f"No user rule. Using **{default_source}** values. Configure below to override.")
 
-# ── Detect field type for specialized forms ──────────────────────────────────
-
-is_email = "email" in field_name.lower() or "email" in label.lower()
-is_name = field_name in ("MEME_FIRST_NAME", "MEME_LAST_NAME", "SBSB_FIRST_NAME", "SBSB_LAST_NAME", "MEME_MID_INIT")
+# ── Context-aware form ───────────────────────────────────────────────────────
 
 with st.form(f"rule_form_{field_name}"):
 
-    if is_email:
-        # ── Email-specific form ──────────────────────────────────────
+    if field_type == "email":
         st.markdown("**Email configuration**")
         col1, col2 = st.columns(2)
-        domain = col1.text_input(
-            "Domain",
-            value=existing_rule["domain"] if existing_rule and existing_rule.get("domain") else "caresource.com",
-            help="e.g., caresource.com",
-        )
-        local_part_method = col2.selectbox(
-            "Local part method",
-            ["name-based", "lookup", "random"],
-            index=0,
-            help="name-based: first initial + last name. lookup: from CSV. random: random string.",
-        )
+        domain = col1.text_input("Domain", value=existing_rule["domain"] if is_user_rule and existing_rule.get("domain") else "caresource.com")
+        local_method = col2.selectbox("Local part", ["name-based", "random"],
+            index=0 if not is_user_rule else (1 if existing_rule.get("format_pattern") == "random" else 0))
         st.caption(f"Preview: jsmith@{domain}")
+        gen_method, data_type, length, prefix, postfix, start_value = "formatted", "text", 0, "", "", 0
+        format_pattern, lookup_source = local_method, ""
 
-        # Store as formatted method
-        gen_method = "formatted"
-        data_type = "text"
-        length = 0
-        prefix = ""
-        postfix = ""
-        start_value = 0
-        format_pattern = local_part_method
-        lookup_source = ""
+    elif field_type == "name":
+        st.markdown("**Name configuration**")
+        available_lookups = get_available_lookups()
+        name_lookups = [l for l in available_lookups if "name" in l]
+        default_lookup = "first_names" if "FIRST" in field_name else "last_names"
+        current = existing_rule["lookup_source"] if is_user_rule and existing_rule.get("lookup_source") else default_lookup
+        lookup_source = st.selectbox("Lookup source", name_lookups or ["first_names", "last_names"],
+            index=0 if current not in (name_lookups or [default_lookup]) else (name_lookups or [default_lookup]).index(current))
+        gen_method, data_type, length, prefix, postfix, start_value = "lookup", "text", 0, "", "", 0
+        domain, format_pattern = "", ""
+
+    elif field_type == "id":
+        st.markdown("**ID configuration**")
+        col1, col2, col3 = st.columns(3)
+        gen_method = col1.selectbox("Method", ["sequential", "random", "constant"],
+            index=["sequential", "random", "constant"].index(existing_rule["gen_method"]) if is_user_rule and existing_rule.get("gen_method") in ["sequential", "random", "constant"] else 0)
+        length = col2.number_input("Length", min_value=1, max_value=50,
+            value=existing_rule["length"] if is_user_rule and existing_rule.get("length") else 10)
+        data_type = col3.selectbox("Data type", ["numeric", "alphanumeric"],
+            index=["numeric", "alphanumeric"].index(existing_rule["data_type"]) if is_user_rule and existing_rule.get("data_type") in ["numeric", "alphanumeric"] else 0)
+        col4, col5, col6 = st.columns(3)
+        prefix = col4.text_input("Prefix", value=existing_rule["prefix"] if is_user_rule and existing_rule.get("prefix") else "")
+        postfix = col5.text_input("Postfix", value=existing_rule["postfix"] if is_user_rule and existing_rule.get("postfix") else "")
+        start_value = col6.number_input("Start value", min_value=0,
+            value=existing_rule["start_value"] if is_user_rule and existing_rule.get("start_value") else 1)
+        domain, format_pattern, lookup_source = "", "", ""
+
+    elif field_type == "status":
+        st.markdown("**Status / code configuration**")
+        gen_method = st.selectbox("Method", ["constant", "lookup"],
+            index=["constant", "lookup"].index(existing_rule["gen_method"]) if is_user_rule and existing_rule.get("gen_method") in ["constant", "lookup"] else 0)
+        if gen_method == "constant":
+            prefix = st.text_input("Value", value=existing_rule["prefix"] if is_user_rule and existing_rule.get("prefix") else "AC")
+        else:
+            prefix = ""
+        available_lookups = get_available_lookups()
+        lookup_source = st.selectbox("Lookup source", [""] + available_lookups, index=0) if gen_method == "lookup" else ""
+        data_type, length, postfix, start_value = "text", 0, "", 0
+        domain, format_pattern = "", ""
 
     else:
-        # ── Standard form ────────────────────────────────────────────
+        # General form
+        st.markdown("**General configuration**")
         col1, col2, col3 = st.columns(3)
-        gen_method = col1.selectbox(
-            "Method",
-            ["sequential", "random", "lookup", "constant"],
-            index=["sequential", "random", "lookup", "constant"].index(
-                existing_rule["gen_method"] if existing_rule and existing_rule["gen_method"] in ["sequential", "random", "lookup", "constant"] else "sequential"
-            ),
-        )
-        data_type = col2.selectbox(
-            "Data type",
-            ["numeric", "alphanumeric", "text"],
-            index=["numeric", "alphanumeric", "text"].index(
-                existing_rule["data_type"] if existing_rule else "alphanumeric"
-            ),
-        )
-        length = col3.number_input(
-            "Length (0=unlimited)",
-            min_value=0, max_value=100,
-            value=existing_rule["length"] if existing_rule and existing_rule["length"] else 10,
-        )
+        gen_method = col1.selectbox("Method", ["sequential", "random", "constant", "lookup"],
+            index=0)
+        data_type = col2.selectbox("Data type", ["text", "numeric", "alphanumeric"], index=0)
+        length = col3.number_input("Length (0=unlimited)", min_value=0, max_value=100, value=0)
+        col4, col5 = st.columns(2)
+        prefix = col4.text_input("Prefix / Value (for constant)", value="")
+        start_value = col5.number_input("Start value", min_value=0, value=1)
+        postfix, domain, format_pattern, lookup_source = "", "", "", ""
 
-        col4, col5, col6 = st.columns(3)
-        prefix = col4.text_input("Prefix",
-            value=existing_rule["prefix"] if existing_rule and existing_rule.get("prefix") else "")
-        postfix = col5.text_input("Postfix",
-            value=existing_rule["postfix"] if existing_rule and existing_rule.get("postfix") else "")
-        start_value = col6.number_input("Start value",
-            min_value=0, value=existing_rule["start_value"] if existing_rule and existing_rule.get("start_value") else 1)
-
-        available_lookups = get_available_lookups()
-        current_lookup = existing_rule["lookup_source"] if existing_rule and existing_rule.get("lookup_source") else ""
-        lookup_options = [""] + available_lookups
-        lookup_idx = lookup_options.index(current_lookup) if current_lookup in lookup_options else 0
-        lookup_source = st.selectbox("Lookup source", lookup_options, index=lookup_idx)
-
-        domain = ""
-        format_pattern = ""
-
-    # ── Buttons ──────────────────────────────────────────────────────
+    # ── Buttons ──────────────────────────────────────────────────
     col_save, col_remove, col_test = st.columns(3)
     save_clicked = col_save.form_submit_button("Save rule", type="primary")
     remove_clicked = col_remove.form_submit_button("Remove rule (revert to default)")
@@ -280,8 +273,7 @@ with st.form(f"rule_form_{field_name}"):
 
     if save_clicked:
         db.upsert_generation_rule(
-            field_name=field_name, field_label=label,
-            field_category=default_source,
+            field_name=field_name, field_label=label, field_category=default_source,
             gen_method=gen_method, data_type=data_type, length=length,
             prefix=prefix, postfix=postfix, start_value=start_value,
             domain=domain, format_pattern=format_pattern,
@@ -291,72 +283,47 @@ with st.form(f"rule_form_{field_name}"):
         st.rerun()
 
     if remove_clicked:
-        if existing_rule:
+        if is_user_rule:
             db.delete_generation_rule(field_name)
             st.success(f"Rule removed. {field_name} reverts to default ({default_source}).")
             st.rerun()
         else:
-            st.info(f"No rule to remove — already using default ({default_source}).")
+            st.info(f"No user rule to remove — already using default ({default_source}).")
 
     if test_clicked:
         SequenceCounter.reset()
-        test_rule = {
-            "field_name": field_name, "gen_method": gen_method,
-            "data_type": data_type, "length": length,
-            "prefix": prefix, "postfix": postfix,
-            "start_value": start_value, "domain": domain,
-            "format_pattern": format_pattern, "lookup_source": lookup_source,
-        }
 
-        if is_email and domain:
+        if field_type == "email" and domain:
             names = generate_names(5)
-            if format_pattern == "name-based" or format_pattern == "":
-                samples = [generate_email(f, l, domain, i) for i, (f, l) in enumerate(names)]
-            elif format_pattern == "random":
-                import random, string
-                samples = [
-                    ''.join(random.choices(string.ascii_lowercase, k=8)) + f"@{domain}"
-                    for _ in range(5)
-                ]
+            if format_pattern == "random":
+                import random as _rnd, string as _str
+                samples = [''.join(_rnd.choices(_str.ascii_lowercase, k=8)) + f"@{domain}" for _ in range(5)]
             else:
                 samples = [generate_email(f, l, domain, i) for i, (f, l) in enumerate(names)]
             st.code("  ".join(samples))
 
-        elif gen_method == "lookup" and lookup_source:
-            if lookup_source == "first_names":
-                # Show only first names for FIRST_NAME fields
-                names = generate_names(5)
-                if "FIRST" in field_name or "first" in label.lower():
-                    st.code("  ".join([n[0] for n in names]))
-                elif "LAST" in field_name or "last" in label.lower():
-                    st.code("  ".join([n[1] for n in names]))
-                else:
-                    st.code("  ".join([f"{n[0]} {n[1]}" for n in names]))
-            elif lookup_source == "last_names":
-                names = generate_names(5)
+        elif field_type == "name":
+            names = generate_names(5)
+            if "FIRST" in field_name:
+                st.code("  ".join([n[0] for n in names]))
+            elif "LAST" in field_name:
                 st.code("  ".join([n[1] for n in names]))
-            elif lookup_source in ("street_names", "zip_city_state"):
-                addrs = generate_addresses(5)
-                if "ZIP" in field_name:
-                    st.code("  ".join([a["zip"] for a in addrs]))
-                elif "CITY" in field_name:
-                    st.code("  ".join([a["city"] for a in addrs]))
-                elif "STATE" in field_name:
-                    st.code("  ".join([a["state"] for a in addrs]))
-                elif "COUNTY" in field_name:
-                    st.code("  ".join([a["county"] for a in addrs]))
-                elif "STREET" in field_name:
-                    st.code("  ".join([a["street_1"] for a in addrs]))
-                else:
-                    st.dataframe(pd.DataFrame(addrs), hide_index=True)
+            elif "MID" in field_name:
+                st.code("  ".join([n[0][0] for n in names]))
             else:
-                try:
-                    from cluster_profiler.generation_rules import _load_lookup
-                    lk = _load_lookup(lookup_source)
-                    samples = lk.iloc[:5].values.tolist()
-                    st.code("  ".join([str(s[0]) if len(s) == 1 else str(s) for s in samples]))
-                except Exception as e:
-                    st.error(str(e))
+                st.code("  ".join([f"{n[0]} {n[1]}" for n in names]))
+
+        elif field_type == "id":
+            rule = {"field_name": field_name, "gen_method": gen_method, "data_type": data_type,
+                    "length": length, "prefix": prefix, "postfix": postfix, "start_value": start_value}
+            vals = generate_id(rule, 5)
+            st.code("  ".join(vals))
+
+        elif field_type == "status" and gen_method == "constant":
+            st.code("  ".join([prefix] * 5))
+
         else:
-            values = generate_id(test_rule, 5)
-            st.code("  ".join(values))
+            rule = {"field_name": field_name, "gen_method": gen_method, "data_type": data_type,
+                    "length": length, "prefix": prefix, "postfix": postfix, "start_value": start_value}
+            vals = generate_id(rule, 5)
+            st.code("  ".join(vals))

@@ -16,13 +16,13 @@ import streamlit as st
 from cluster_profiler.styles import inject_css
 from cluster_profiler.db import bootstrap
 
-st.set_page_config(page_title="Pattern Discovery", layout="wide")
+st.set_page_config(page_title="SDM Platform", layout="wide")
 inject_css()
 
 # Initialize database on first run
 bootstrap()
 
-landing = st.Page("pages/top_50.py", title="Pattern Discovery", default=True)
+landing = st.Page("pages/top_50.py", title="System Discovered Patterns", default=True)
 profiler = st.Page("pages/1_profiler.py", title="Pattern Profiler")
 explorer = st.Page("pages/2_dataset_explorer.py", title="Dataset Explorer")
 keyword = st.Page("pages/3_keyword_search.py", title="Keyword Search")

@@ -108,8 +108,7 @@ for p in patterns[:30]:
         "Tags": tag_str,
     })
 
-# Select all toggle
-select_all = st.checkbox("Select all patterns", value=True, key="kw_select_all")
+st.caption("Select specific patterns below, or leave unselected to use all patterns.")
 
 event = st.dataframe(
     pd.DataFrame(table_data),
@@ -120,14 +119,13 @@ event = st.dataframe(
 )
 
 # Determine selected patterns
-if select_all:
-    selected_patterns = patterns[:len(table_data)]
-else:
-    selected_indices = event.selection.rows
-    if not selected_indices:
-        st.info("Select patterns above or check **Select all** to proceed with generation.")
-        st.stop()
+selected_indices = event.selection.rows
+if selected_indices:
     selected_patterns = [patterns[i] for i in selected_indices]
+    st.markdown(f"**{len(selected_patterns)} of {len(table_data)} patterns selected**")
+else:
+    selected_patterns = patterns[:len(table_data)]
+    st.markdown(f"**All {len(selected_patterns)} patterns selected** (no specific selection made)")
 
 # Recompute weights for selected subset
 selected_total = sum(p["member_count"] for p in selected_patterns)
@@ -135,7 +133,7 @@ selected_weights = {}
 for p in selected_patterns:
     selected_weights[p["id"]] = round(p["member_count"] / selected_total, 4) if selected_total > 0 else 0
 
-st.markdown(f"**{len(selected_patterns)} patterns selected** · {selected_total:,} total members")
+st.caption(f"{selected_total:,} total members across selected patterns")
 
 # ── Generation ───────────────────────────────────────────────────────────────
 
