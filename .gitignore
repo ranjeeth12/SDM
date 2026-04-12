@@ -14,11 +14,6 @@ env/
 # Environment / secrets
 .env
 
-# Data files
-data/*.csv
-data/*.xlsx
-data/*.png
-
 # IDE
 .vscode/
 .idea/
@@ -34,3 +29,7 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Generated / temporary
+*.zip
+data_bkp/
