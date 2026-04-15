@@ -1,9 +1,7 @@
-"""Load denormalized models and apply hierarchy filters.
+"""Load data from SQL Server and apply hierarchy filters.
 
-Three denorm models:
-  Member   → demographics, group/plan/benefit hierarchy
-  Provider → NPIs, specialties, networks (optional, loaded when available)
-  Claims   → ICD/CPT correlations, adjudication (optional, loaded when available)
+Primary source: sdm.member_denorm table in SQL Server.
+Fallback: CSV files if SQL Server is unavailable.
 """
 
 import pandas as pd
@@ -16,39 +14,110 @@ from .config import (
     PROVIDER_DENORM_PATH,
     CLAIMS_DENORM_PATH,
     DEFAULT_REFERENCE_DATE,
+    get_connection_string,
+    SQL_SCHEMA,
 )
 
 
-def load_member_denorm(data_path=None, labels_path=None, reference_date=None):
-    """Read member denorm and labels, derive _age and _tenure features."""
-    data_path = data_path or MEMBER_DENORM_PATH
-    labels_path = labels_path or MEMBER_LABELS_PATH
-    reference_date = reference_date or DEFAULT_REFERENCE_DATE
+def _try_sql_connection():
+    """Test if SQL Server is reachable."""
+    try:
+        import pyodbc
+        conn = pyodbc.connect(get_connection_string(), timeout=5)
+        conn.close()
+        return True
+    except Exception:
+        return False
 
-    df = pd.read_csv(data_path)
-    labels_df = pd.read_csv(labels_path)
+
+def load_member_denorm(data_path=None, labels_path=None, reference_date=None):
+    """Read member denorm from SQL Server, derive _age and _tenure.
+
+    Falls back to CSV if SQL Server is unavailable.
+    """
+    reference_date = reference_date or DEFAULT_REFERENCE_DATE
     ref = pd.Timestamp(reference_date)
 
-    df['_age'] = (ref - pd.to_datetime(df['MEME_BIRTH_DT'])).dt.days / 365.25
-    df['_tenure'] = (ref - pd.to_datetime(df['MEME_ORIG_EFF_DT'])).dt.days / 30.44
+    # Try SQL Server first
+    if _try_sql_connection():
+        import pyodbc
+        conn = pyodbc.connect(get_connection_string())
+        df = pd.read_sql(f"SELECT * FROM {SQL_SCHEMA}.member_denorm", conn)
+        conn.close()
+
+        # Labels: generate from denorm (clustering labels derived from member data)
+        # If a labels table exists in SQL Server, read it; otherwise build from denorm
+        try:
+            conn = pyodbc.connect(get_connection_string())
+            labels_df = pd.read_sql(f"SELECT * FROM {SQL_SCHEMA}.member_labels", conn)
+            conn.close()
+        except Exception:
+            # Build labels from denorm data
+            labels_df = df[['MEME_CK', 'GRGR_CK', 'SGSG_CK', 'CSPD_CAT', 'LOBD_ID']].copy()
+
+    else:
+        # Fallback to CSV
+        data_path = data_path or MEMBER_DENORM_PATH
+        labels_path = labels_path or MEMBER_LABELS_PATH
+
+        if data_path and Path(data_path).exists():
+            df = pd.read_csv(data_path)
+            labels_df = pd.read_csv(labels_path) if labels_path and Path(labels_path).exists() else \
+                         df[['MEME_CK', 'GRGR_CK', 'SGSG_CK', 'CSPD_CAT', 'LOBD_ID']].copy()
+        else:
+            raise FileNotFoundError(
+                "SQL Server unavailable and no CSV fallback found. "
+                "Set SDM_SQL_SERVER env var or place CSV in data/source/."
+            )
+
+    # Derive age and tenure
+    if 'MEME_BIRTH_DT' in df.columns:
+        df['_age'] = (ref - pd.to_datetime(df['MEME_BIRTH_DT'], errors='coerce')).dt.days / 365.25
+    else:
+        df['_age'] = 0
+
+    if 'MEME_ORIG_EFF_DT' in df.columns:
+        df['_tenure'] = (ref - pd.to_datetime(df['MEME_ORIG_EFF_DT'], errors='coerce')).dt.days / 30.44
+    else:
+        df['_tenure'] = 0
 
     return df, labels_df
 
 
 def load_provider_denorm(path=None):
-    """Load provider denorm if available. Returns DataFrame or None."""
+    """Load provider denorm. SQL Server first, then CSV fallback."""
+    if _try_sql_connection():
+        try:
+            import pyodbc
+            conn = pyodbc.connect(get_connection_string())
+            df = pd.read_sql(f"SELECT * FROM {SQL_SCHEMA}.provider_denorm", conn)
+            conn.close()
+            return df
+        except Exception:
+            pass
+
     path = path or PROVIDER_DENORM_PATH
-    if path is None or not Path(path).exists():
-        return None
-    return pd.read_csv(path)
+    if path is not None and Path(path).exists():
+        return pd.read_csv(path)
+    return None
 
 
 def load_claims_denorm(path=None):
-    """Load claims denorm if available. Returns DataFrame or None."""
+    """Load claims denorm. SQL Server first, then CSV fallback."""
+    if _try_sql_connection():
+        try:
+            import pyodbc
+            conn = pyodbc.connect(get_connection_string())
+            df = pd.read_sql(f"SELECT * FROM {SQL_SCHEMA}.claims_denorm", conn)
+            conn.close()
+            return df
+        except Exception:
+            pass
+
     path = path or CLAIMS_DENORM_PATH
-    if path is None or not Path(path).exists():
-        return None
-    return pd.read_csv(path)
+    if path is not None and Path(path).exists():
+        return pd.read_csv(path)
+    return None
 
 
 # Backward-compatible alias
@@ -92,10 +161,7 @@ def apply_filters(df, labels_df, grgr_ck=None, sgsg_ck=None, cspd_cat=None, lobd
             f"No members match the applied filters: {filters_used}"
         )
 
-    # Keep full filtered data for family analysis before dedup
     family_data = filtered.copy()
-
-    # Deduplicate to one row per member
     members = filtered.drop_duplicates(subset=['MEME_CK']).copy()
 
     return members, filtered_labels, family_data, filters_used

@@ -4,10 +4,12 @@ Every data element is generated using configured rules and governed lookups.
 No AI is used in the generation path. AI's only role is offline enrichment
 of lookup lists (separate process, not invoked during generation).
 
+Lookups are read from SQL Server tables (sdm.lkp_*) with CSV fallback.
+
 Generation methods:
   sequential  → Incrementing counter with prefix/postfix (for IDs)
   random      → Random value within configured constraints
-  lookup      → Pick from a governed lookup CSV (for names, streets, zips)
+  lookup      → Pick from a governed lookup table (for names, streets, zips)
   formatted   → Build from a format pattern using other generated values
   derived     → Derived from another field (e.g., city from zip)
 """
@@ -23,35 +25,91 @@ from . import db
 
 _LOOKUPS_DIR = Path(__file__).resolve().parent.parent / "data" / "lookups"
 
+# SQL Server lookup table name mapping
+_SQL_LOOKUP_MAP = {
+    "first_names": "lkp_first_names",
+    "last_names": "lkp_last_names",
+    "street_names": "lkp_street_names",
+    "zip_city_state": "lkp_zip_city_state",
+}
+
 # ── Lookup cache ─────────────────────────────────────────────────────────────
 
 _lookup_cache = {}
 
 
 def _load_lookup(name: str) -> pd.DataFrame:
-    """Load a lookup CSV by name, with caching."""
+    """Load a lookup by name. SQL Server first, CSV fallback. Cached."""
     if name in _lookup_cache:
         return _lookup_cache[name]
 
-    path = _LOOKUPS_DIR / f"{name}.csv"
-    if not path.exists():
-        raise FileNotFoundError(f"Lookup file not found: {path}")
+    # Try SQL Server
+    sql_table = _SQL_LOOKUP_MAP.get(name)
+    if sql_table:
+        try:
+            from .config import get_connection_string, SQL_SCHEMA
+            import pyodbc
+            conn = pyodbc.connect(get_connection_string(), timeout=5)
+            df = pd.read_sql(
+                f"SELECT * FROM {SQL_SCHEMA}.{sql_table}",
+                conn,
+            )
+            conn.close()
+            # Drop SQL metadata columns
+            drop_cols = [c for c in ("id", "created_at") if c in df.columns]
+            df = df.drop(columns=drop_cols)
+            _lookup_cache[name] = df
+            return df
+        except Exception:
+            pass  # Fall through to CSV
 
-    df = pd.read_csv(path)
-    _lookup_cache[name] = df
-    return df
+    # CSV fallback
+    path = _LOOKUPS_DIR / f"{name}.csv"
+    if path.exists():
+        df = pd.read_csv(path)
+        _lookup_cache[name] = df
+        return df
+
+    raise FileNotFoundError(
+        f"Lookup '{name}' not found in SQL Server (sdm.{sql_table or '?'}) or CSV ({path})"
+    )
 
 
 def clear_lookup_cache():
-    """Clear the lookup cache (call after updating lookup files)."""
+    """Clear the lookup cache (call after updating lookup data)."""
     _lookup_cache.clear()
 
 
 def get_available_lookups() -> list[str]:
-    """List available lookup file names."""
-    if not _LOOKUPS_DIR.exists():
-        return []
-    return [f.stem for f in _LOOKUPS_DIR.glob("*.csv")]
+    """List available lookup names from SQL Server, with CSV fallback."""
+    lookups = set()
+
+    # SQL Server
+    try:
+        from .config import get_connection_string, SQL_SCHEMA
+        import pyodbc
+        conn = pyodbc.connect(get_connection_string(), timeout=5)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+            f"WHERE TABLE_SCHEMA = ? AND TABLE_NAME LIKE 'lkp_%'",
+            (SQL_SCHEMA,)
+        )
+        for row in cur.fetchall():
+            # Reverse map: lkp_first_names → first_names
+            table_name = row[0]
+            short_name = table_name.replace("lkp_", "", 1)
+            lookups.add(short_name)
+        conn.close()
+    except Exception:
+        pass
+
+    # CSV fallback
+    if _LOOKUPS_DIR.exists():
+        for f in _LOOKUPS_DIR.glob("*.csv"):
+            lookups.add(f.stem)
+
+    return sorted(lookups)
 
 
 # ── Rule-based generators ────────────────────────────────────────────────────

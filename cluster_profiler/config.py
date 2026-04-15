@@ -2,28 +2,57 @@
 
 Architecture
 ------------
-This tool reads from three denormalized models, populated by a separate
-ETL/data-scoop process from source tables (e.g., FACETS). The tool never
-accesses source tables directly.
+This tool reads from SQL Server tables populated by a separate
+ETL/data-scoop process from source tables (e.g., FACETS).
 
-  Member Denorm   → groups, subgroups, products, plans, benefits, demographics
-  Provider Denorm → NPIs, specialties, networks, locations, geographic coverage
-  Claims Denorm   → ICD/CPT correlations, adjudication patterns, billed/paid amounts
-
-Generated synthetic data is for export/download only — it is never written
-back into the denormalized models or source tables.
+  sdm.member_denorm   → demographics, group/plan/benefit hierarchy
+  sdm.lkp_*           → Governed lookup tables for synthetic generation
+  sdm.patterns        → System-discovered pattern metadata
+  sdm.generation_rules → Per-field generation configuration
 """
 
-# ── Denormalized Model Paths (read-only source of truth) ─────────────────────
+import os
+
+# ── SQL Server Connection ────────────────────────────────────────────────────
+# Override via environment variables or .env file
+
+SQL_SERVER   = os.environ.get("SDM_SQL_SERVER", "localhost")
+SQL_DATABASE = os.environ.get("SDM_SQL_DATABASE", "SDM_Platform")
+SQL_SCHEMA   = os.environ.get("SDM_SQL_SCHEMA", "sdm")
+SQL_USERNAME = os.environ.get("SDM_SQL_USERNAME", "")
+SQL_PASSWORD = os.environ.get("SDM_SQL_PASSWORD", "")
+SQL_DRIVER   = os.environ.get("SDM_SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+
+
+def get_connection_string():
+    """Build pyodbc connection string."""
+    if SQL_USERNAME:
+        return (
+            f"DRIVER={{{SQL_DRIVER}}};"
+            f"SERVER={SQL_SERVER};"
+            f"DATABASE={SQL_DATABASE};"
+            f"UID={SQL_USERNAME};"
+            f"PWD={SQL_PASSWORD};"
+            f"TrustServerCertificate=yes;"
+        )
+    else:
+        return (
+            f"DRIVER={{{SQL_DRIVER}}};"
+            f"SERVER={SQL_SERVER};"
+            f"DATABASE={SQL_DATABASE};"
+            f"Trusted_Connection=yes;"
+            f"TrustServerCertificate=yes;"
+        )
+
+
+DEFAULT_REFERENCE_DATE = '2025-01-01'
+
+# ── Legacy CSV paths (fallback if SQL Server unavailable) ────────────────────
 
 MEMBER_DENORM_PATH = 'data/source/MEMBER_GROUP_PLAN_FLAT_generated.csv'
 MEMBER_LABELS_PATH = 'data/source/MEMBER_GROUP_PLAN_FLAT_generated_labels.csv'
-
-# Provider and Claims denorms — set to None until data scoop delivers them
-PROVIDER_DENORM_PATH = None   # e.g., 'data/source/PROVIDER_DENORM.csv'
-CLAIMS_DENORM_PATH = None     # e.g., 'data/source/CLAIMS_DENORM.csv'
-
-DEFAULT_REFERENCE_DATE = '2025-01-01'
+PROVIDER_DENORM_PATH = None
+CLAIMS_DENORM_PATH = None
 
 # ── Pattern Analysis Features ────────────────────────────────────────────────
 
@@ -49,13 +78,3 @@ LABEL_CLUSTER_COLUMNS = {
     'plan': 'plan_cluster_idx',
     'product': 'product_cluster_idx',
 }
-
-# ── Synthetic Data Generation Rules ──────────────────────────────────────────
-# What gets generated (synthetic PII):
-#   Names, DOBs, SSNs, Member IDs, addresses
-#
-# What gets reused from denorms (reference/configuration data):
-#   NPIs, Provider IDs        → from Provider Denorm
-#   ICD/CPT distributions     → from Claims Denorm
-#   Group/Subgroup/Plan/Product/Benefit keys → from Member Denorm
-#   LOBD_ID, CSCS_ID, CSPD_CAT → from Member Denorm
