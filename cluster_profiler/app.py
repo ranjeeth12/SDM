@@ -1,4 +1,6 @@
 """Entry point: multi-page Streamlit app with explicit navigation."""
+from dotenv import load_dotenv
+load_dotenv("cluster_profiler/.env")
 
 import sys
 from pathlib import Path
