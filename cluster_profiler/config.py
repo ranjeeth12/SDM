@@ -1,27 +1,15 @@
-"""Constants and column definitions for the cluster profiler.
-
-Architecture
-------------
-This tool reads from SQL Server tables populated by a separate
-ETL/data-scoop process from source tables (e.g., FACETS).
-
-  sdm.member_denorm   → demographics, group/plan/benefit hierarchy
-  sdm.lkp_*           → Governed lookup tables for synthetic generation
-  sdm.patterns        → System-discovered pattern metadata
-  sdm.generation_rules → Per-field generation configuration
-"""
+"""Constants and column definitions for the cluster profiler."""
 
 import os
 
 # ── SQL Server Connection ────────────────────────────────────────────────────
-# Override via environment variables or .env file
 
-SQL_SERVER   = os.environ.get("SDM_SQL_SERVER", "localhost")
-SQL_DATABASE = os.environ.get("SDM_SQL_DATABASE", "SDM_Platform")
-SQL_SCHEMA   = os.environ.get("SDM_SQL_SCHEMA", "sdm")
-SQL_USERNAME = os.environ.get("SDM_SQL_USERNAME", "")
-SQL_PASSWORD = os.environ.get("SDM_SQL_PASSWORD", "")
-SQL_DRIVER   = os.environ.get("SDM_SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+SQL_SERVER   = "ASCUSLAP20522,1433"
+SQL_DATABASE = "SDM_Platform"
+SQL_SCHEMA   = "sdm"
+SQL_USERNAME = ""
+SQL_PASSWORD = ""
+SQL_DRIVER   = "ODBC Driver 17 for SQL Server"
 
 
 def get_connection_string():
