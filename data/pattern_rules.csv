@@ -1,0 +1,7 @@
+name,pattern_id,members,rule
+KY-MA-Medical-Advantag-Adult-Family-P2,2,1071,"GRGR_CK IN (12) AND
+41 ≤ Age ≤ 47 AND
+88 ≤ Tenure (months) ≤ 115 AND
+MEME_SEX = M (50%) AND
+MEME_MARITAL_STATUS = M (73%) AND
+Spouse present (54%)"
