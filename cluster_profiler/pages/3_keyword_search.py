@@ -13,16 +13,11 @@ import streamlit as st
 from cluster_profiler import db
 from cluster_profiler.keyword_search import parse_query, search, allocate_volume
 from cluster_profiler.config import DEFAULT_REFERENCE_DATE
-from cluster_profiler.data_loader import load_data
+from cluster_profiler.data_loader import load_filtered_members
 from cluster_profiler.synthetic import generate_synthetic_subscribers
 from cluster_profiler.synthetic_claims import generate_synthetic_claims, DenormNotAvailableError
 from cluster_profiler.synthetic_enrollment import generate_synthetic_enrollments
 from cluster_profiler.edi_formatter import enrollment_to_edi
-
-
-@st.cache_data
-def cached_load_data():
-    return load_data()
 
 
 # ── Init ─────────────────────────────────────────────────────────────────────
@@ -150,8 +145,6 @@ confirmation = (
 st.markdown(confirmation)
 
 if st.button("Generate Data", type="primary"):
-    df, labels_df = cached_load_data()
-
     allocation = allocate_volume(selected_weights, volume)
     all_outputs = []
     denorm_error = None
@@ -181,21 +174,12 @@ if st.button("Generate Data", type="primary"):
         # Load profile
         profile = json.loads(pattern["profile_json"]) if pattern.get("profile_json") else {}
 
-        # Load source data (denorm records for this pattern) for fallback
+        # Load source data directly from SQL (no re-clustering)
         raw_df = None
         try:
-            from cluster_profiler.data_loader import apply_filters
-            from cluster_profiler.clustering import discover_clusters
-            subset_m, subset_l, _, f_used = apply_filters(
-                df, labels_df, **{k: v if isinstance(v, list) else [v] for k, v in filters.items()},
-            )
-            assignments, _ = discover_clusters(subset_m, subset_l, k=None, use_labels=False, filters_used=f_used)
-            cid = pattern.get("cluster_id", 0)
-            mask = np.array(assignments) == cid
-            if mask.any():
-                raw_df = subset_m.iloc[mask]
+            raw_df, _, _, _ = load_filtered_members(**filters)
         except Exception:
-            pass  # Fall back to no source data
+            pass
 
         try:
             if parsed["data_type"] == "members":

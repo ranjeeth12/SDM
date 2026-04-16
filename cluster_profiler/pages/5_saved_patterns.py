@@ -17,15 +17,10 @@ import streamlit as st
 
 from cluster_profiler import db
 from cluster_profiler.config import DEFAULT_REFERENCE_DATE
-from cluster_profiler.data_loader import load_data, apply_filters
+from cluster_profiler.data_loader import load_filtered_members
 from cluster_profiler.synthetic import generate_synthetic_subscribers
 from cluster_profiler.synthetic_enrollment import generate_synthetic_enrollments
 from cluster_profiler.edi_formatter import enrollment_to_edi
-
-
-@st.cache_data
-def cached_load_data():
-    return load_data()
 
 
 st.title("Saved Patterns")
@@ -134,7 +129,6 @@ for i, pattern in enumerate(saved):
     # Handle generation
     gen_active = st.session_state.pop(f"_gen_active_{pattern['id']}", None)
     if gen_active:
-        df, labels_df = cached_load_data()
         combo = {
             "grgr_ck": json.loads(pattern["grgr_ck"]) if pattern.get("grgr_ck") else None,
             "sgsg_ck": json.loads(pattern["sgsg_ck"]) if pattern.get("sgsg_ck") else None,
@@ -144,7 +138,7 @@ for i, pattern in enumerate(saved):
         filters = {k: v for k, v in combo.items() if v is not None}
 
         try:
-            subset_m, _, _, f_used = apply_filters(df, labels_df, **filters)
+            subset_m, _, _, f_used = load_filtered_members(**filters)
         except ValueError:
             subset_m = None
 

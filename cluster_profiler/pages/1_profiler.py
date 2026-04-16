@@ -19,7 +19,10 @@ from cluster_profiler.config import (
     DESCRIPTION_COLUMNS,
 )
 from cluster_profiler.clustering import build_features, discover_clusters
-from cluster_profiler.data_loader import apply_filters, load_data
+from cluster_profiler.data_loader import (
+    get_groups, get_subgroups, get_plan_categories, get_lobs,
+    load_filtered_members, get_overview_metrics,
+)
 from cluster_profiler.formatters import format_json
 from cluster_profiler.profiler import build_subset_summary, profile_all_clusters
 from cluster_profiler.synthetic import generate_synthetic_subscribers
@@ -28,11 +31,7 @@ from cluster_profiler.synthetic_enrollment import generate_synthetic_enrollments
 from cluster_profiler.edi_formatter import enrollment_to_edi
 from cluster_profiler.naming import build_contextual_name
 from cluster_profiler import db
-
-
-@st.cache_data
-def cached_load_data():
-    return load_data()
+from cluster_profiler.paginator import paginated_df
 
 
 def format_option(key, name):
@@ -210,8 +209,7 @@ def generate_pattern_summary(profile_json: str, pattern_id: int, total_members: 
 
 
 # ── Data Loading ──────────────────────────────────────────────────────────────
-
-df, labels_df = cached_load_data()
+# No full table load here — cascading filters query SQL directly
 
 # ── Check for pre-selections from landing page ──────────────────────────────
 
@@ -223,7 +221,7 @@ preselect_k = st.session_state.pop("preselect_k", None)
 preselect_cluster_id = st.session_state.pop("preselect_cluster_id", None)
 auto_run = st.session_state.pop("auto_run", False)
 
-# ── Sidebar: Cascading Filters ────────────────────────────────────────────────
+# ── Sidebar: Cascading Filters (SQL pushdown) ────────────────────────────────
 
 st.sidebar.header("Hierarchy Filters")
 
@@ -240,11 +238,7 @@ def _match_preselect(options, preselect_values, cast=str):
 
 
 # 1. Group
-group_pairs = (
-    df[["GRGR_CK", "GRGR_NAME"]]
-    .drop_duplicates()
-    .sort_values("GRGR_NAME")
-)
+group_pairs = get_groups()
 group_options = _build_options(group_pairs, "GRGR_CK", "GRGR_NAME")
 
 if preselect_grgr is not None and "wk_group" not in st.session_state:
@@ -254,12 +248,7 @@ selected_group_labels = st.sidebar.multiselect("Group", group_options, key="wk_g
 selected_grgr_cks = [int(parse_option_key(g)) for g in selected_group_labels]
 
 # 2. Subgroup
-filtered = df[df["GRGR_CK"].isin(selected_grgr_cks)] if selected_grgr_cks else df
-subgroup_pairs = (
-    filtered[["SGSG_CK", "SGSG_NAME"]]
-    .drop_duplicates()
-    .sort_values("SGSG_NAME")
-)
+subgroup_pairs = get_subgroups(selected_grgr_cks or None)
 subgroup_options = _build_options(subgroup_pairs, "SGSG_CK", "SGSG_NAME")
 
 if preselect_sgsg is not None and "wk_subgroup" not in st.session_state:
@@ -269,12 +258,9 @@ selected_subgroup_labels = st.sidebar.multiselect("Subgroup", subgroup_options, 
 selected_sgsg_cks = [int(parse_option_key(s)) for s in selected_subgroup_labels]
 
 # 3. Plan Category
-if selected_sgsg_cks:
-    filtered = filtered[filtered["SGSG_CK"].isin(selected_sgsg_cks)]
-cat_pairs = (
-    filtered[["CSPD_CAT", "CSPD_CAT_DESC"]]
-    .drop_duplicates()
-    .sort_values("CSPD_CAT_DESC")
+cat_pairs = get_plan_categories(
+    selected_grgr_cks or None,
+    selected_sgsg_cks or None,
 )
 cat_options = _build_options(cat_pairs, "CSPD_CAT", "CSPD_CAT_DESC")
 
@@ -285,12 +271,10 @@ selected_cat_labels = st.sidebar.multiselect("Plan Category", cat_options, key="
 selected_cspd_cats = [parse_option_key(c) for c in selected_cat_labels]
 
 # 4. Line of Business
-if selected_cspd_cats:
-    filtered = filtered[filtered["CSPD_CAT"].isin(selected_cspd_cats)]
-lob_pairs = (
-    filtered[["LOBD_ID", "PLDS_DESC"]]
-    .drop_duplicates()
-    .sort_values("PLDS_DESC")
+lob_pairs = get_lobs(
+    selected_grgr_cks or None,
+    selected_sgsg_cks or None,
+    selected_cspd_cats or None,
 )
 lob_options = _build_options(lob_pairs, "LOBD_ID", "PLDS_DESC")
 
@@ -344,8 +328,8 @@ def _make_cache_key(filters_used, k):
     return hashlib.md5(raw.encode()).hexdigest()
 
 try:
-    subset_members, subset_labels, family_data, filters_used = apply_filters(
-        df, labels_df, grgr_ck=grgr_ck, sgsg_ck=sgsg_ck,
+    subset_members, subset_labels, family_data, filters_used = load_filtered_members(
+        grgr_ck=grgr_ck, sgsg_ck=sgsg_ck,
         cspd_cat=cspd_cat, lobd_id=lobd_id,
     )
 except ValueError as exc:
@@ -376,7 +360,8 @@ else:
 
 # ── Header Metrics ────────────────────────────────────────────────────────────
 
-pct_of_total = summary["total_members"] / df["MEME_CK"].nunique() * 100
+_overview = get_overview_metrics()
+pct_of_total = summary["total_members"] / _overview["n_members"] * 100
 col1, col2, col3 = st.columns(3)
 col1.metric("Subset of Total", f"{pct_of_total:.1f}%")
 col2.metric("Patterns Found", metrics["n_clusters"])
@@ -493,7 +478,7 @@ for container, profile in zip(containers, profiles):
                 )
 
         if raw_clicked:
-            st.dataframe(raw_df, width="stretch", height=400)
+            paginated_df(raw_df, key=f"raw_page_{cid}", title=f"Raw data — {rule_name}")
 
         st.divider()
 

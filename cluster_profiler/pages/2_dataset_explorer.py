@@ -13,21 +13,17 @@ import pandas as pd
 import streamlit as st
 
 from cluster_profiler.config import DEFAULT_REFERENCE_DATE
-from cluster_profiler.data_loader import load_data, apply_filters
+from cluster_profiler.data_loader import (
+    get_groups, get_subgroups, get_plan_categories, get_lobs,
+    load_filtered_members, load_members_by_ids,
+)
 from cluster_profiler.profiler import profile_all_clusters
 from cluster_profiler.dataset_explorer import (
     find_patterns_for_members,
     compare_patterns,
 )
 from cluster_profiler.naming import build_contextual_name
-
-
-@st.cache_data
-def cached_load_data():
-    return load_data()
-
-
-df, labels_df = cached_load_data()
+from cluster_profiler.paginator import paginated_df, paginated_view_by_ids
 
 st.title("Dataset Explorer")
 st.caption(
@@ -50,35 +46,40 @@ meme_cks = []
 
 if method == "Group / Subgroup filter":
     col1, col2 = st.columns(2)
-    groups = sorted(df["GRGR_NAME"].unique())
+    group_df = get_groups()
+    groups = sorted(group_df["GRGR_NAME"].unique())
     selected_group = col1.selectbox("Group", [""] + list(groups), key="de_group")
 
-    subset = df
     if selected_group:
-        subset = df[df["GRGR_NAME"] == selected_group]
-        subgroups = sorted(subset["SGSG_NAME"].unique())
+        grgr_ck = group_df[group_df["GRGR_NAME"] == selected_group]["GRGR_CK"].tolist()
+        sg_df = get_subgroups(grgr_ck)
+        subgroups = sorted(sg_df["SGSG_NAME"].unique())
         selected_subgroup = col2.selectbox("Subgroup", ["All"] + list(subgroups), key="de_sg")
 
-        if selected_subgroup != "All":
-            subset = subset[subset["SGSG_NAME"] == selected_subgroup]
+        sgsg_ck = sg_df[sg_df["SGSG_NAME"] == selected_subgroup]["SGSG_CK"].tolist() if selected_subgroup != "All" else None
 
-        # Plan Category (depth 3)
         col3, col4 = st.columns(2)
-        plan_cats = sorted(subset["CSPD_CAT_DESC"].dropna().unique())
+        cat_df = get_plan_categories(grgr_ck, sgsg_ck)
+        plan_cats = sorted(cat_df["CSPD_CAT_DESC"].dropna().unique())
         selected_plan = col3.selectbox("Plan category", ["All"] + list(plan_cats), key="de_plan")
 
-        if selected_plan != "All":
-            subset = subset[subset["CSPD_CAT_DESC"] == selected_plan]
+        cspd_cat = cat_df[cat_df["CSPD_CAT_DESC"] == selected_plan]["CSPD_CAT"].tolist() if selected_plan != "All" else None
 
-        # Line of Business (depth 4)
-        lobs = sorted(subset["PLDS_DESC"].dropna().unique())
+        lob_df = get_lobs(grgr_ck, sgsg_ck, cspd_cat)
+        lobs = sorted(lob_df["PLDS_DESC"].dropna().unique())
         selected_lob = col4.selectbox("Line of business", ["All"] + list(lobs), key="de_lob")
 
-        if selected_lob != "All":
-            subset = subset[subset["PLDS_DESC"] == selected_lob]
+        lobd_id = lob_df[lob_df["PLDS_DESC"] == selected_lob]["LOBD_ID"].tolist() if selected_lob != "All" else None
 
-        meme_cks = subset["MEME_CK"].unique().tolist()
-        st.caption(f"Selected {len(meme_cks):,} members")
+        try:
+            subset, _, _, _ = load_filtered_members(
+                grgr_ck=grgr_ck, sgsg_ck=sgsg_ck,
+                cspd_cat=cspd_cat, lobd_id=lobd_id,
+            )
+            meme_cks = subset["MEME_CK"].unique().tolist()
+            st.caption(f"Selected {len(meme_cks):,} members")
+        except ValueError:
+            st.warning("No members match the selected filters.")
 
 elif method == "Member IDs":
     ids_input = st.text_area(
@@ -91,10 +92,18 @@ elif method == "Member IDs":
         st.caption(f"Parsed {len(meme_cks)} member IDs")
 
 elif method == "Random sample":
+    import pyodbc
+    from cluster_profiler.config import get_connection_string, SQL_SCHEMA
     sample_col1, sample_col2 = st.columns([3, 1])
     sample_size = sample_col1.slider("Sample size", 10, 500, 50, key="de_sample_size")
     if sample_col2.button("Draw sample"):
-        meme_cks = df["MEME_CK"].drop_duplicates().sample(sample_size).tolist()
+        conn = pyodbc.connect(get_connection_string())
+        sample_df = pd.read_sql(
+            f"SELECT DISTINCT TOP ({sample_size}) MEME_CK FROM {SQL_SCHEMA}.member_denorm ORDER BY NEWID()",
+            conn,
+        )
+        conn.close()
+        meme_cks = sample_df["MEME_CK"].tolist()
         st.session_state["de_sampled"] = meme_cks
     meme_cks = st.session_state.get("de_sampled", [])
     if meme_cks:
@@ -109,7 +118,15 @@ st.divider()
 
 if "de_results" not in st.session_state or st.button("Find patterns", type="primary"):
     with st.spinner("Analyzing pattern associations..."):
-        results = find_patterns_for_members(df, labels_df, meme_cks, max_combos=40)
+        # Load member data only when needed for pattern analysis
+        member_df = load_members_by_ids(meme_cks)
+        if member_df.empty:
+            st.warning("No matching members found in the database.")
+            st.stop()
+        # Load full data for clustering (needed by find_patterns_for_members)
+        full_df, full_labels, _, _ = load_filtered_members()
+        results = find_patterns_for_members(full_df, full_labels, meme_cks, max_combos=40)
+        del full_df, full_labels  # Free memory immediately
     st.session_state["de_results"] = results
 
 results = st.session_state.get("de_results", [])
@@ -202,8 +219,7 @@ if st.button("Show datasets", type="primary"):
         combo = r["combo"]
 
         try:
-            subset_members, subset_labels, family_data, filters_used = apply_filters(
-                df, labels_df,
+            subset_members, subset_labels, family_data, filters_used = load_filtered_members(
                 grgr_ck=combo.get("grgr_ck"),
                 sgsg_ck=combo.get("sgsg_ck"),
                 cspd_cat=combo.get("cspd_cat"),
@@ -219,13 +235,14 @@ if st.button("Show datasets", type="primary"):
             m3.metric("Pattern", selected_names[0])
 
             if not searched_in_pattern.empty:
-                st.markdown("**Your searched members matching this pattern:**")
-                st.dataframe(searched_in_pattern, hide_index=True, width="stretch", height=300)
+                paginated_df(searched_in_pattern, key="de_searched_single",
+                             title="Your searched members matching this pattern")
             else:
                 st.info("Your searched members don't fall within this pattern's hierarchy filters.")
 
             with st.expander(f"All {len(subset_members):,} members in this pattern's hierarchy"):
-                st.dataframe(subset_members, hide_index=True, width="stretch", height=400)
+                paginated_df(subset_members, key="de_all_single",
+                             title="All members in hierarchy")
 
         except ValueError as e:
             st.error(str(e))
@@ -239,8 +256,7 @@ if st.button("Show datasets", type="primary"):
         for r in selected_patterns:
             combo = r["combo"]
             try:
-                subset_members, subset_labels, family_data, filters_used = apply_filters(
-                    df, labels_df,
+                subset_members, subset_labels, family_data, filters_used = load_filtered_members(
                     grgr_ck=combo.get("grgr_ck"),
                     sgsg_ck=combo.get("sgsg_ck"),
                     cspd_cat=combo.get("cspd_cat"),
@@ -278,20 +294,25 @@ if st.button("Show datasets", type="primary"):
 
         # Show your searched members across selected patterns
         if searched_in_union:
-            searched_df = df[df["MEME_CK"].isin(searched_in_union)].drop_duplicates(subset=["MEME_CK"])
-            st.markdown(f"**{len(searched_df):,} of your searched members** found across the selected patterns:")
-            st.dataframe(searched_df, hide_index=True, width="stretch", height=300)
+            paginated_view_by_ids(
+                list(searched_in_union), key="de_searched_multi",
+                title=f"{len(searched_in_union):,} of your searched members found across selected patterns",
+            )
 
         # Show full union
-        union_df = df[df["MEME_CK"].isin(union_set)].drop_duplicates(subset=["MEME_CK"])
-        with st.expander(f"All {len(union_df):,} members across selected patterns (union)"):
-            st.dataframe(union_df, hide_index=True, width="stretch", height=400)
+        with st.expander(f"All {len(union_set):,} members across selected patterns (union)"):
+            paginated_view_by_ids(
+                list(union_set), key="de_union",
+                title="Union — members in any selected pattern",
+            )
 
         # Show intersection if any
         if intersection:
-            common_df = df[df["MEME_CK"].isin(intersection)].drop_duplicates(subset=["MEME_CK"])
-            with st.expander(f"{len(common_df):,} members in ALL selected patterns (overlap)"):
-                st.dataframe(common_df, hide_index=True, width="stretch", height=400)
+            with st.expander(f"{len(intersection):,} members in ALL selected patterns (overlap)"):
+                paginated_view_by_ids(
+                    list(intersection), key="de_overlap",
+                    title="Overlap — members in every selected pattern",
+                )
 
         # Comparison table if we have profiles
         if len(all_profiles) >= 2:

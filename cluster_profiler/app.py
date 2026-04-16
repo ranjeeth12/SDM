@@ -11,9 +11,15 @@ import streamlit as st
 
 from cluster_profiler.styles import inject_css
 from cluster_profiler.db import bootstrap
+from cluster_profiler.paginator import cleanup_temp_files
 
 st.set_page_config(page_title="SDM Platform", layout="wide")
 inject_css()
+
+# Clean temp files from previous sessions
+if "_temp_cleaned" not in st.session_state:
+    cleanup_temp_files()
+    st.session_state["_temp_cleaned"] = True
 
 bootstrap()
 

@@ -11,14 +11,9 @@ import pandas as pd
 import streamlit as st
 
 from cluster_profiler.config import DEFAULT_REFERENCE_DATE
-from cluster_profiler.data_loader import load_data
+from cluster_profiler.data_loader import get_overview_metrics, load_filtered_members
 from cluster_profiler.discovery import discover_top_patterns
 from cluster_profiler import db
-
-
-@st.cache_data
-def cached_load_data():
-    return load_data()
 
 
 def load_patterns_from_db(top_n=50, rank_by="Member Count"):
@@ -35,9 +30,12 @@ def load_patterns_from_db(top_n=50, rank_by="Member Count"):
     return all_patterns[:top_n]
 
 
-def run_fresh_discovery(df, labels_df, top_n=50):
-    """Run full discovery with progress bar, persist to DB."""
-    progress_bar = st.progress(0, text="Discovering patterns...")
+def run_fresh_discovery(top_n=50):
+    """Run full discovery with progress bar, persist to DB. Loads data on demand."""
+    progress_bar = st.progress(0, text="Loading data...")
+
+    # Load full data only for discovery (one-time operation)
+    df, labels_df, _, _ = load_filtered_members()
 
     def progress_callback(i, total, combo):
         pct = (i + 1) / total
@@ -62,14 +60,11 @@ st.caption(
     "ranked by member count or silhouette score."
 )
 
-df, labels_df = cached_load_data()
-
-# ── Dataset overview metrics ──────────────────────────────────────────────────
-
-n_members = df["MEME_CK"].nunique()
-n_groups = df["GRGR_CK"].nunique()
-n_subgroups = df["SGSG_CK"].nunique()
-n_lobs = df["LOBD_ID"].nunique()
+overview = get_overview_metrics()
+n_members = overview["n_members"]
+n_groups = overview["n_groups"]
+n_subgroups = overview["n_subgroups"]
+n_lobs = overview["n_lobs"]
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Total Members", f"{n_members:,}")
@@ -103,7 +98,7 @@ if has_persisted:
 
     if refresh_clicked:
         with st.spinner("Re-analyzing all hierarchy combinations..."):
-            run_fresh_discovery(df, labels_df, top_n=top_n)
+            run_fresh_discovery(top_n=top_n)
         db_patterns = load_patterns_from_db(top_n=top_n, rank_by=rank_by)
         st.success(f"Refreshed. {len(db_patterns)} patterns updated.")
         st.rerun()
@@ -115,7 +110,7 @@ else:
     st.info("No patterns found in repository. Click below to run initial discovery (one-time setup).")
     if st.button("Run Initial Discovery", type="primary"):
         with st.spinner("Analyzing all hierarchy combinations (first-time setup)..."):
-            run_fresh_discovery(df, labels_df, top_n=top_n)
+            run_fresh_discovery(top_n=top_n)
         db_patterns = load_patterns_from_db(top_n=top_n, rank_by=rank_by)
         if db_patterns:
             st.success(f"Discovery complete. {len(db_patterns)} patterns persisted to repository.")
@@ -277,11 +272,10 @@ if selected_rows:
     # Inline quick generate
     if btn2.button("Quick generate members", key="preview_gen_members"):
         from cluster_profiler.synthetic import generate_synthetic_subscribers
-        from cluster_profiler.data_loader import apply_filters
         filters = {k: v for k, v in combo.items() if v is not None}
         raw_df = None
         try:
-            subset_m, _, _, f_used = apply_filters(df, labels_df, **filters)
+            subset_m, _, _, f_used = load_filtered_members(**filters)
             raw_df = subset_m
         except Exception:
             pass
@@ -297,11 +291,10 @@ if selected_rows:
         from cluster_profiler.synthetic import generate_synthetic_subscribers
         from cluster_profiler.synthetic_enrollment import generate_synthetic_enrollments
         from cluster_profiler.edi_formatter import enrollment_to_edi
-        from cluster_profiler.data_loader import apply_filters
         filters = {k: v for k, v in combo.items() if v is not None}
         raw_df = None
         try:
-            subset_m, _, _, f_used = apply_filters(df, labels_df, **filters)
+            subset_m, _, _, f_used = load_filtered_members(**filters)
             raw_df = subset_m
         except Exception:
             pass
